@@ -1,4 +1,4 @@
--- Ball Trajectory Visual - LocalPlayer
+-- Ball Trajectory Visual - LocalPlayer (With Toggle & Team Check)
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -8,27 +8,30 @@ local LocalPlayer = Players.LocalPlayer
 
 -- Xóa trajectory cũ
 local oldFolder = Workspace:FindFirstChild("TrajectoryVisuals")
-
 if oldFolder then
-oldFolder:Destroy()
+    oldFolder:Destroy()
 end
 
 -- Chờ DataLoaded nếu có
 pcall(function()
-LocalPlayer:WaitForChild("DataLoaded")
+    LocalPlayer:WaitForChild("DataLoaded")
 end)
 
 task.wait(1)
 
--- Config
+-- ==========================================
+-- CONFIGURATION (CẤU HÌNH)
+-- ==========================================
+local ENABLE_TRACKER = true -- Đổi thành false để tắt hoàn toàn (Nút bật/tắt của bạn)
+local LOBBY_TEAM_NAME = "Lobby" -- Tên đội ở sảnh của game (sửa lại cho đúng với game của bạn)
+
 local TRAJECTORY_TIME = 2
 local STEP = 0.05
-
-local TRAJECTORY_COLOR = ColorSequence.new(
-Color3.fromRGB(255, 238, 0)
-)
-
 local BEAM_WIDTH = 0.3
+local TRAJECTORY_COLOR = ColorSequence.new(
+    Color3.fromRGB(255, 238, 0)
+)
+-- ==========================================
 
 -- Folder
 local Folder = Instance.new("Folder")
@@ -41,164 +44,156 @@ local Beams = {}
 
 -- Tính vị trí quỹ đạo
 local function getTrajectoryPosition(position, velocity, time)
-local gravity = Vector3.new(0, -Workspace.Gravity, 0)
-
-
-return position
-    + velocity * time
-    + gravity * 0.5 * time ^ 2
-
-
+    local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+    return position + (velocity * time) + (gravity * 0.5 * time ^ 2)
 end
 
 -- Tạo Attachment + Beam
 local function getOrCreateElements(index)
+    if not Attachments[index] then
+        local attachment = Instance.new("Attachment")
+        attachment.Name = "TrajectoryAttachment_" .. index
+        attachment.Parent = Workspace.Terrain
+        Attachments[index] = attachment
+    end
 
+    if index > 1 and not Beams[index - 1] then
+        local beam = Instance.new("Beam")
+        beam.Name = "TrajectoryBeam_" .. (index - 1)
+        beam.Color = TRAJECTORY_COLOR
+        beam.Width0 = BEAM_WIDTH
+        beam.Width1 = BEAM_WIDTH
+        beam.FaceCamera = true
+        beam.Transparency = NumberSequence.new(0)
+        beam.Segments = 1
+        beam.Attachment0 = Attachments[index - 1]
+        beam.Attachment1 = Attachments[index]
+        beam.Parent = Folder
+        
+        Beams[index - 1] = beam
+    end
 
-if not Attachments[index] then
-    local attachment = Instance.new("Attachment")
-    attachment.Name = "TrajectoryAttachment_" .. index
-    attachment.Parent = Workspace.Terrain
-
-    Attachments[index] = attachment
+    Attachments[index].Visible = false
+    
+    if Beams[index - 1] then
+        Beams[index - 1].Enabled = true
+    end
 end
 
-if index > 1 and not Beams[index - 1] then
-    local beam = Instance.new("Beam")
-
-    beam.Name = "TrajectoryBeam_" .. (index - 1)
-    beam.Color = TRAJECTORY_COLOR
-    beam.Width0 = BEAM_WIDTH
-    beam.Width1 = BEAM_WIDTH
-    beam.FaceCamera = true
-    beam.Transparency = NumberSequence.new(0)
-    beam.Segments = 1
-
-    beam.Attachment0 = Attachments[index - 1]
-    beam.Attachment1 = Attachments[index]
-
-    beam.Parent = Folder
-
-    Beams[index - 1] = beam
-end
-
-Attachments[index].Visible = false
-
-if Beams[index - 1] then
-    Beams[index - 1].Enabled = true
-end
-
-
+-- Ẩn quỹ đạo (Dùng khi tắt Tracker hoặc khi vào Lobby)
+local function hideTrajectory()
+    for _, beam in pairs(Beams) do
+        if beam then
+            beam.Enabled = false
+        end
+    end
 end
 
 -- Update trajectory
 local function updateTrajectory(ball)
+    if not ball or not ball:IsDescendantOf(Workspace) then
+        return
+    end
 
+    local index = 1
 
-if not ball then
-    return
-end
-
-if not ball:IsDescendantOf(Workspace) then
-    return
-end
-
-local index = 1
-
-for time = 0, TRAJECTORY_TIME, STEP do
-
-    getOrCreateElements(index)
-
-    Attachments[index].WorldPosition =
-        getTrajectoryPosition(
+    for time = 0, TRAJECTORY_TIME, STEP do
+        getOrCreateElements(index)
+        Attachments[index].WorldPosition = getTrajectoryPosition(
             ball.Position,
             ball.AssemblyLinearVelocity,
             time
         )
-
-    index += 1
-end
-
--- Tắt phần dư
-for i = index, #Attachments do
-
-    if Attachments[i] then
-        Attachments[i].WorldPosition = Vector3.new(0, -1000, 0)
+        index += 1
     end
 
-    if Beams[i - 1] then
-        Beams[i - 1].Enabled = false
+    -- Tắt phần dư
+    for i = index, #Attachments do
+        if Attachments[i] then
+            Attachments[i].WorldPosition = Vector3.new(0, -1000, 0)
+        end
+        if Beams[i - 1] then
+            Beams[i - 1].Enabled = false
+        end
     end
-end
-
-
 end
 
 -- Tìm Ball
 local Ball = Workspace:FindFirstChild("Ball")
 
 local function getBall()
-
-
-if Ball and Ball:IsDescendantOf(Workspace) then
+    if Ball and Ball:IsDescendantOf(Workspace) then
+        return Ball
+    end
+    Ball = Workspace:FindFirstChild("Ball")
     return Ball
 end
 
-Ball = Workspace:FindFirstChild("Ball")
-
-return Ball
-
-
+-- Điều kiện hiển thị Tracker
+local function canShowTracker()
+    -- Nếu công tắc tắt -> Không hiện
+    if not ENABLE_TRACKER then 
+        return false 
+    end
+    
+    -- Nếu Player có Team và Team Name là Lobby -> Không hiện
+    if LocalPlayer.Team and LocalPlayer.Team.Name == LOBBY_TEAM_NAME then 
+        return false 
+    end
+    
+    -- Các trường hợp còn lại -> Cho phép hiện
+    return true
 end
 
 -- Render loop
 local connection
-
 connection = RunService.RenderStepped:Connect(function()
+    
+    -- Kiểm tra xem có đủ điều kiện hiện không
+    if not canShowTracker() then
+        hideTrajectory() -- Giấu các tia sáng nếu đang vẽ dở
+        return -- Dừng việc tính toán lại
+    end
 
-
-local ball = getBall()
-
-if ball then
-    updateTrajectory(ball)
-end
-
-
+    local ball = getBall()
+    
+    if ball then
+        updateTrajectory(ball)
+    else
+        hideTrajectory() -- Giấu các tia sáng nếu bóng bất ngờ bị xóa
+    end
+    
 end)
 
 -- Cleanup
 local function cleanup()
-
-
-if connection then
-    connection:Disconnect()
-    connection = nil
-end
-
-for _, beam in pairs(Beams) do
-    if beam then
-        beam:Destroy()
+    if connection then
+        connection:Disconnect()
+        connection = nil
     end
-end
 
-for _, attachment in pairs(Attachments) do
-    if attachment then
-        attachment:Destroy()
+    for _, beam in pairs(Beams) do
+        if beam then
+            beam:Destroy()
+        end
     end
-end
 
-table.clear(Beams)
-table.clear(Attachments)
+    for _, attachment in pairs(Attachments) do
+        if attachment then
+            attachment:Destroy()
+        end
+    end
 
-if Folder then
-    Folder:Destroy()
-    Folder = nil
-end
+    table.clear(Beams)
+    table.clear(Attachments)
 
-
+    if Folder then
+        Folder:Destroy()
+        Folder = nil
+    end
 end
 
 -- Khi script bị destroy
 script.Destroying:Connect(function()
-cleanup()
+    cleanup()
 end)
