@@ -5,109 +5,228 @@ local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 -- ==========================================
--- [ CẤU HÌNH MẶC ĐỊNH ]
+-- [ CẤU HÌNH HỆ THỐNG ]
 -- ==========================================
 local Config = {
-    MasterEnabled = true,          -- Bật/Tắt toàn bộ Tracker
-    ShowBounceVisuals = true,      -- Bật/Tắt hiển thị quỹ đạo nẩy bóng
-    MinBounceRender = 2,           -- Chỉ render vị trí nẩy từ lần thứ 2 trở đi (1 = tất cả, 2 = từ lần nẩy 2)
-    ShowLandingTimer = true,       -- Bật/Tắt ô vị trí rơi & đếm thời gian
+    MasterEnabled = true,
+    DrawAllBounces = false,
     
-    TrajectoryTime = 3.5,          -- Thời gian quét tối đa (giây)
-    TimeStep = 0.04,               -- Độ mịn của đường vẽ
-    BeamWidth = 0.35,              -- Độ rộng đường quỹ đạo
-    MaxBounces = 4,                -- Số lần va chạm nẩy tối đa
-    Elasticity = 0.8,              -- Hệ số nẩy của bóng (động năng)
+    TrajectoryTime = 6.0,    -- Thời gian dự đoán tối đa (giây)
+    TimeStep = 0.03,         -- Độ mịn vạch vẽ
+    BeamWidth = 0.35,        
+    MaxBounces = 4,          
+    Elasticity = 0.75,       -- Độ nảy bóng (0.75 = 75%)
     
-    CurrentColor = Color3.fromRGB(255, 238, 0), -- Màu mặc định (Vàng)
-    LobbyTeamName = "Lobby"
+    CurrentColor = Color3.fromRGB(0, 255, 238)
 }
 
 -- ==========================================
--- [ DỌN DẸP DỮ LIỆU CŨ (CLEANUP) ]
+-- [ KHỞI TẠO BIẾN & CACHE ]
 -- ==========================================
-local GuiParent = (gethui and gethui()) or pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
+local cachedPoints = {}
+
+local raycastParams = RaycastParams.new()
+raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+raycastParams.RespectCanCollide = true 
+
+local cachedBall = nil
+local lastBallCheck = 0
+
+-- Biến theo dõi vị trí thực tế để tự tính vận tốc
+local lastBallPos = nil
+local lastBallTime = 0
+local calculatedVelocity = Vector3.zero
+
+-- ==========================================
+-- [ QUẢN LÝ THƯ MỤC & POOLING ]
+-- ==========================================
+local GuiParent = (gethui and gethui()) or (pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui")) or LocalPlayer:WaitForChild("PlayerGui")
 
 if GuiParent:FindFirstChild("BallTrackerUI") then GuiParent.BallTrackerUI:Destroy() end
-if Workspace:FindFirstChild("TrajectoryVisuals") then Workspace.TrajectoryVisuals:Destroy() end
 if _G.BallTrackerConnection then _G.BallTrackerConnection:Disconnect(); _G.BallTrackerConnection = nil end
 
-local Folder = Instance.new("Folder")
-Folder.Name = "TrajectoryVisuals"
-Folder.Parent = Workspace
+local function getVisualFolder()
+    local folder = Workspace:FindFirstChild("TrajectoryVisuals")
+    if not folder then
+        folder = Instance.new("Folder")
+        folder.Name = "TrajectoryVisuals"
+        folder.Parent = Workspace
+    end
+    return folder
+end
 
--- Quản lý Object Pool để tối ưu hiệu năng
 local AttachmentsPool = {}
 local BeamsPool = {}
-local MarkersPool = {}
+
+local function clearAndHideAll()
+    for _, beam in pairs(BeamsPool) do
+        if beam and beam.Parent then beam.Enabled = false end
+    end
+end
 
 -- ==========================================
--- [ HÀM TÍNH TOÁN QUỸ ĐẠO & NẨY BÓNG ]
+-- [ LOGIC TÌM BÓNG & TRÍCH XUẤT VẬN TỐC ]
 -- ==========================================
-local function predictTrajectoryWithBounces(startPos, initialVel)
-    local points = {}
-    local impactPoints = {} -- Lưu { position, time, bounceIndex }
+local function getActiveBall()
+    if cachedBall and cachedBall.Parent and cachedBall:IsDescendantOf(Workspace) then
+        return cachedBall
+    end
     
-    local currentPos = startPos
-    local currentVel = initialVel
-    local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+    cachedBall = nil 
+    local now = os.clock()
+    if now - lastBallCheck < 0.3 then return nil end 
+    lastBallCheck = now
+    
+    local possibleNames = {"Ball", "SoccerBall", "Football", "TPSBall", "TpsBall"}
+    for _, name in ipairs(possibleNames) do
+        local b = Workspace:FindFirstChild(name, true)
+        if b and b:IsA("BasePart") and b:IsDescendantOf(Workspace) then
+            cachedBall = b
+            return b
+        end
+    end
+    return nil
+end
+
+local function getEffectiveVelocity(ball)
+    local now = os.clock()
+    local currentPos = ball.Position
+    
+    -- 1. Tự tính vận tốc thực qua biến thiên vị trí
+    if lastBallPos and (now - lastBallTime) > 0 then
+        local realDt = now - lastBallTime
+        if realDt < 0.2 then
+            calculatedVelocity = (currentPos - lastBallPos) / realDt
+        end
+    end
+    lastBallPos = currentPos
+    lastBallTime = now
+
+    -- 2. Đọc AssemblyLinearVelocity gốc
+    local physVel = ball.AssemblyLinearVelocity
+    if physVel and physVel.Magnitude > 1.5 then
+        return physVel
+    end
+
+    -- 3. Đọc từ BodyVelocity / LinearVelocity
+    local bv = ball:FindFirstChildOfClass("BodyVelocity")
+    if bv and bv.Velocity.Magnitude > 1.5 then
+        return bv.Velocity
+    end
+    
+    local lv = ball:FindFirstChildOfClass("LinearVelocity")
+    if lv and lv.VectorVelocity.Magnitude > 1.5 then
+        return lv.VectorVelocity
+    end
+
+    -- 4. Trả về vận tốc tự tính
+    if calculatedVelocity.Magnitude > 1.5 then
+        return calculatedVelocity
+    end
+
+    return Vector3.zero
+end
+
+-- ==========================================
+-- [ CẬP NHẬT BỘ LỌC VA CHẠM ]
+-- ==========================================
+local function updateRaycastFilter(ball)
+    local ignoreList = {getVisualFolder(), ball}
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then
+            table.insert(ignoreList, player.Character)
+        end
+    end
+    
+    if ball.Parent and ball.Parent:IsA("Model") then 
+        table.insert(ignoreList, ball.Parent) 
+    end
+    
+    raycastParams.FilterDescendantsInstances = ignoreList
+end
+
+-- ==========================================
+-- [ THUẬT TOÁN DỰ ĐOÁN QUỸ ĐẠO BẢO TOÀN ]
+-- ==========================================
+local function predictTrajectory(ball)
+    table.clear(cachedPoints)
+    local firstImpactIndex = -1
+    
+    local currentVel = getEffectiveVelocity(ball)
+    
+    if currentVel.Magnitude < 1.2 then 
+        return cachedPoints, firstImpactIndex 
+    end
+    
+    local currentPos = ball.Position
+    local gravityVal = Workspace.Gravity > 0 and Workspace.Gravity or 196.2
+    local gravity = Vector3.new(0, -gravityVal, 0)
+    
     local totalTime = 0
-    local dt = Config.TimeStep
+    local stepDt = Config.TimeStep
     local bounceCount = 0
     
-    local raycastParams = RaycastParams.new()
-    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-    local ignoreList = {Folder}
-    local ball = Workspace:FindFirstChild("Ball")
-    if ball then table.insert(ignoreList, ball) end
-    if LocalPlayer.Character then table.insert(ignoreList, LocalPlayer.Character) end
-    raycastParams.FilterDescendantsInstances = ignoreList
-
-    table.insert(points, currentPos)
+    table.insert(cachedPoints, currentPos)
 
     while totalTime < Config.TrajectoryTime and bounceCount < Config.MaxBounces do
-        local nextPos = currentPos + currentVel * dt + 0.5 * gravity * (dt ^ 2)
-        local rayResult = Workspace:Raycast(currentPos, nextPos - currentPos, raycastParams)
+        local nextPos = currentPos + (currentVel * stepDt) + (0.5 * gravity * (stepDt ^ 2))
+        local dir = nextPos - currentPos
+        
+        local rayResult = Workspace:Raycast(currentPos, dir, raycastParams)
         
         if rayResult then
             bounceCount = bounceCount + 1
             local hitPos = rayResult.Position
             local hitNormal = rayResult.Normal
             
-            local dist = (hitPos - currentPos).Magnitude
-            local stepDist = (nextPos - currentPos).Magnitude
-            local fraction = stepDist > 0 and (dist / stepDist) or 1
-            local hitTime = totalTime + (dt * fraction)
+            local stepDist = dir.Magnitude
+            local actualDist = (hitPos - currentPos).Magnitude
+            local fraction = stepDist > 0 and (actualDist / stepDist) or 1
             
-            table.insert(points, hitPos)
-            table.insert(impactPoints, {
-                position = hitPos,
-                time = hitTime,
-                bounceIndex = bounceCount
-            })
-
-            -- Tính toán động năng sau va chạm (Phản xạ vận tốc)
-            local velAtImpact = currentVel + gravity * (dt * fraction)
-            local reflectVel = velAtImpact - 2 * velAtImpact:Dot(hitNormal) * hitNormal
+            table.insert(cachedPoints, hitPos)
+            if bounceCount == 1 then 
+                firstImpactIndex = #cachedPoints 
+            end
             
-            currentVel = reflectVel * Config.Elasticity
-            currentPos = hitPos + hitNormal * 0.05 -- Tránh kẹt Raycast tại mặt phẳng
-            totalTime = hitTime
+            local velAtImpact = currentVel + (gravity * (stepDt * fraction))
+            currentVel = (velAtImpact - (2 * velAtImpact:Dot(hitNormal) * hitNormal)) * Config.Elasticity
+            
+            currentPos = hitPos + (hitNormal * 0.08)
+            totalTime = totalTime + (stepDt * fraction)
+            
+            if currentVel.Magnitude < 1.5 then break end
         else
             currentPos = nextPos
-            currentVel = currentVel + gravity * dt
-            totalTime = totalTime + dt
-            table.insert(points, currentPos)
+            currentVel = currentVel + (gravity * stepDt)
+            totalTime = totalTime + stepDt
+            table.insert(cachedPoints, currentPos)
         end
     end
 
-    return points, impactPoints
+    -- Bổ sung: Rọi tia thẳng xuống đất làm điểm cuối cho đường Beam nếu bóng đang lơ lửng
+    if bounceCount == 0 and #cachedPoints > 0 then
+        local lastPoint = cachedPoints[#cachedPoints]
+        local downRay = Workspace:Raycast(lastPoint, Vector3.new(0, -500, 0), raycastParams)
+        
+        if downRay then
+            table.insert(cachedPoints, downRay.Position)
+            firstImpactIndex = #cachedPoints
+        end
+    end
+
+    return cachedPoints, firstImpactIndex
 end
 
 -- ==========================================
--- [ HỆ THỐNG RENDER VISUALS ]
+-- [ OBJECT POOLING VISUALS ]
 -- ==========================================
 local function getOrCreateBeam(index)
+    local targetFolder = getVisualFolder()
+    
+    if AttachmentsPool[index] and not AttachmentsPool[index].Parent then AttachmentsPool[index] = nil end
+    if index > 1 and BeamsPool[index - 1] and not BeamsPool[index - 1].Parent then BeamsPool[index - 1] = nil end
+
     if not AttachmentsPool[index] then
         local att = Instance.new("Attachment")
         att.Name = "Att_" .. index
@@ -123,7 +242,7 @@ local function getOrCreateBeam(index)
         beam.FaceCamera = true
         beam.Attachment0 = AttachmentsPool[index - 1]
         beam.Attachment1 = AttachmentsPool[index]
-        beam.Parent = Folder
+        beam.Parent = targetFolder
         BeamsPool[index - 1] = beam
     end
 
@@ -133,85 +252,74 @@ local function getOrCreateBeam(index)
     end
 end
 
-local function getOrCreateMarker(index)
-    if not MarkersPool[index] then
-        local part = Instance.new("Part")
-        part.Name = "ImpactMarker_" .. index
-        part.Size = Vector3.new(2, 0.2, 2)
-        part.Anchored = true
-        part.CanCollide = false
-        part.Material = Enum.Material.Neon
-        part.Parent = Folder
-
-        local box = Instance.new("SelectionBox")
-        box.Name = "Outline"
-        box.Adornee = part
-        box.LineThickness = 0.05
-        box.Parent = part
-
-        local bgui = Instance.new("BillboardGui")
-        bgui.Name = "TimerGui"
-        bgui.Size = UDim2.new(0, 100, 0, 40)
-        bgui.StudsOffset = Vector3.new(0, 2.5, 0)
-        bgui.AlwaysOnTop = true
-        bgui.Parent = part
-
-        local txt = Instance.new("TextLabel")
-        txt.Name = "TimeTxt"
-        txt.Size = UDim2.new(1, 0, 1, 0)
-        txt.BackgroundTransparency = 1
-        txt.Font = Enum.Font.GothamBold
-        txt.TextSize = 16
-        txt.TextColor3 = Color3.fromRGB(255, 255, 255)
-        txt.TextStrokeTransparency = 0
-        txt.Parent = bgui
-
-        MarkersPool[index] = {Part = part, Box = box, Gui = bgui, Text = txt}
+-- ==========================================
+-- [ RENDER LOOP ]
+-- ==========================================
+local function renderLoop()
+    if not Config.MasterEnabled then 
+        clearAndHideAll()
+        return 
     end
+
+    local ball = getActiveBall()
+    if not ball then 
+        clearAndHideAll()
+        return 
+    end
+
+    updateRaycastFilter(ball)
     
-    local item = MarkersPool[index]
-    item.Part.Color = Config.CurrentColor
-    item.Box.Color3 = Config.CurrentColor
-    item.Part.Transparency = 0.3
-    item.Part.Parent = Folder
-    return item
+    local points, firstImpactIdx = predictTrajectory(ball)
+    if #points == 0 then clearAndHideAll(); return end
+
+    -- Render Beams
+    local beamIdx = 1
+    local maxPointIdx = Config.DrawAllBounces and #points or (firstImpactIdx > 0 and firstImpactIdx or #points)
+
+    for i = 1, maxPointIdx do
+        if points[i] then
+            getOrCreateBeam(beamIdx)
+            if AttachmentsPool[beamIdx] then AttachmentsPool[beamIdx].WorldPosition = points[i] end
+            beamIdx = beamIdx + 1
+        end
+    end
+
+    for i = beamIdx, #AttachmentsPool do
+        if AttachmentsPool[i] and AttachmentsPool[i].Parent then AttachmentsPool[i].WorldPosition = Vector3.new(0, -1000, 0) end
+        if BeamsPool[i - 1] and BeamsPool[i - 1].Parent then BeamsPool[i - 1].Enabled = false end
+    end
 end
 
-local function hideAllVisuals()
-    for _, beam in pairs(BeamsPool) do beam.Enabled = false end
-    for _, m in pairs(MarkersPool) do m.Part.Transparency = 1; m.Gui.Enabled = false; m.Box.Adornee = nil end
-end
+_G.BallTrackerConnection = RunService.RenderStepped:Connect(renderLoop)
 
 -- ==========================================
--- [ GIAO DIỆN NGUỜI DÙNG (GUI MENU) ]
+-- [ GIAO DIỆN NGƯỜI DÙNG (UI) ]
 -- ==========================================
 local ScreenGui = Instance.new("ScreenGui", GuiParent)
 ScreenGui.Name = "BallTrackerUI"
 ScreenGui.ResetOnSpawn = false
 
--- Nút Bật/Tắt Menu nhanh
 local ToggleMenuBtn = Instance.new("TextButton", ScreenGui)
-ToggleMenuBtn.Size = UDim2.new(0, 110, 0, 35)
-ToggleMenuBtn.Position = UDim2.new(0.01, 0, 0.2, 0)
-ToggleMenuBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+ToggleMenuBtn.Size = UDim2.new(0, 120, 0, 35)
+ToggleMenuBtn.Position = UDim2.new(0.01, 0, 0.18, 0)
+ToggleMenuBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
 ToggleMenuBtn.Text = "⚡ Tracker Menu"
 ToggleMenuBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 ToggleMenuBtn.Font = Enum.Font.GothamBold
 ToggleMenuBtn.TextSize = 12
 Instance.new("UICorner", ToggleMenuBtn).CornerRadius = UDim.new(0, 8)
 local ToggleStroke = Instance.new("UIStroke", ToggleMenuBtn)
-ToggleStroke.Color = Color3.fromRGB(255, 238, 0)
+ToggleStroke.Color = Config.CurrentColor
 ToggleStroke.Thickness = 1.5
 
--- Khung Menu Chính
 local MainFrame = Instance.new("Frame", ScreenGui)
-MainFrame.Size = UDim2.new(0, 320, 0, 340)
-MainFrame.Position = UDim2.new(0.08, 0, 0.2, 0)
-MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+MainFrame.Size = UDim2.new(0, 310, 0, 260)
+MainFrame.Position = UDim2.new(0.08, 0, 0.18, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 MainFrame.BorderSizePixel = 0
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+MainFrame.Visible = false
 
--- Thêm tính năng kéo thả Menu (Draggable)
 local dragging, dragStart, startPos
 MainFrame.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -228,41 +336,36 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
-ToggleMenuBtn.MouseButton1Click:Connect(function()
-    MainFrame.Visible = not MainFrame.Visible
-end)
+ToggleMenuBtn.MouseButton1Click:Connect(function() MainFrame.Visible = not MainFrame.Visible end)
 
--- Tiêu đề Menu
 local Title = Instance.new("TextLabel", MainFrame)
-Title.Size = UDim2.new(1, 0, 0, 40)
+Title.Size = UDim2.new(1, 0, 0, 38)
 Title.BackgroundTransparency = 1
-Title.Text = "⚽ Ball Trajectory Controls"
+Title.Text = "⚽ Ball Trajectory Manager"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
-Title.TextSize = 14
+Title.TextSize = 13
 
 local Layout = Instance.new("UIListLayout", MainFrame)
 Layout.SortOrder = Enum.SortOrder.LayoutOrder
-Layout.Padding = UDim.new(0, 8)
+Layout.Padding = UDim.new(0, 7)
 Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-Title.LayoutOrder = 0
 
--- Hàm tạo Nút Bật/Tắt (Toggle Switch)
-local function createToggleButton(text, defaultState, onClick)
+local function createToggle(text, defaultState, onClick)
     local btn = Instance.new("TextButton", MainFrame)
-    btn.Size = UDim2.new(0.9, 0, 0, 36)
+    btn.Size = UDim2.new(0.92, 0, 0, 34)
     btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
+    btn.TextSize = 11
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     
     local state = defaultState
     local function updateVisual()
         if state then
-            btn.BackgroundColor3 = Color3.fromRGB(46, 125, 50)
+            btn.BackgroundColor3 = Color3.fromRGB(40, 140, 60)
             btn.Text = text .. ": BẬT 🟢"
         else
-            btn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+            btn.BackgroundColor3 = Color3.fromRGB(160, 45, 45)
             btn.Text = text .. ": TẮT 🔴"
         end
     end
@@ -277,128 +380,52 @@ local function createToggleButton(text, defaultState, onClick)
     return btn
 end
 
--- Tạo các nút công tắc
-createToggleButton("Tracker Tổng", Config.MasterEnabled, function(st) Config.MasterEnabled = st end)
+createToggle("Công Tắc Tracker Tổng", Config.MasterEnabled, function(st) Config.MasterEnabled = st end)
 
-local bounceBtn = createToggleButton("Quỹ Đạo Nẩy (Bounce)", Config.ShowBounceVisuals, function(st) Config.ShowBounceVisuals = st end)
+local bounceModeBtn = Instance.new("TextButton", MainFrame)
+bounceModeBtn.Size = UDim2.new(0.92, 0, 0, 32)
+bounceModeBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+bounceModeBtn.Font = Enum.Font.GothamBold
+bounceModeBtn.TextSize = 11
+bounceModeBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+bounceModeBtn.Text = Config.DrawAllBounces and "Quỹ Đạo: VẼ TẤT CẢ CÁC ĐIỂM 🌐" or "Quỹ Đạo: CHỈ ĐIỂM RƠI ĐẦU 🎯"
+Instance.new("UICorner", bounceModeBtn).CornerRadius = UDim.new(0, 6)
 
-local minBounceBtn = Instance.new("TextButton", MainFrame)
-minBounceBtn.Size = UDim2.new(0.9, 0, 0, 32)
-minBounceBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-minBounceBtn.Font = Enum.Font.GothamBold
-minBounceBtn.TextSize = 11
-minBounceBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
-minBounceBtn.Text = "Chế độ Nẩy: Từ lần 2 trở đi 🎯"
-Instance.new("UICorner", minBounceBtn).CornerRadius = UDim.new(0, 6)
-
-minBounceBtn.MouseButton1Click:Connect(function()
-    if Config.MinBounceRender == 2 then
-        Config.MinBounceRender = 1
-        minBounceBtn.Text = "Chế độ Nẩy: Hiển thị TẤT CẢ 🌐"
+bounceModeBtn.MouseButton1Click:Connect(function()
+    Config.DrawAllBounces = not Config.DrawAllBounces
+    if Config.DrawAllBounces then
+        bounceModeBtn.Text = "Quỹ Đạo: VẼ TẤT CẢ CÁC ĐIỂM 🌐"
     else
-        Config.MinBounceRender = 2
-        minBounceBtn.Text = "Chế độ Nẩy: Từ lần 2 trở đi 🎯"
+        bounceModeBtn.Text = "Quỹ Đạo: CHỈ ĐIỂM RƠI ĐẦU 🎯"
     end
+    clearAndHideAll()
 end)
 
-createToggleButton("Ô Đếm Thời Gian Rơi (ETA)", Config.ShowLandingTimer, function(st) Config.ShowLandingTimer = st end)
-
--- BẢNG MÀU SẮC (COLOR PALETTE)
 local PaletteLabel = Instance.new("TextLabel", MainFrame)
-PaletteLabel.Size = UDim2.new(0.9, 0, 0, 20)
+PaletteLabel.Size = UDim2.new(0.92, 0, 0, 18)
 PaletteLabel.BackgroundTransparency = 1
-PaletteLabel.Text = "🎨 Bảng Màu Giao Diện:"
-PaletteLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+PaletteLabel.Text = "🎨 Chọn Màu Giao Diện:"
+PaletteLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
 PaletteLabel.Font = Enum.Font.GothamBold
 PaletteLabel.TextSize = 11
 PaletteLabel.TextXAlignment = Enum.TextXAlignment.Left
 
 local PaletteFrame = Instance.new("Frame", MainFrame)
-PaletteFrame.Size = UDim2.new(0.9, 0, 0, 35)
+PaletteFrame.Size = UDim2.new(0.92, 0, 0, 32)
 PaletteFrame.BackgroundTransparency = 1
 local PaletteLayout = Instance.new("UIGridLayout", PaletteFrame)
-PaletteLayout.CellSize = UDim2.new(0, 38, 0, 32)
-PaletteLayout.CellPadding = UDim2.new(0, 8, 0, 0)
+PaletteLayout.CellSize = UDim2.new(0, 38, 0, 30)
+PaletteLayout.CellPadding = UDim2.new(0, 7, 0, 0)
 
 local ColorsList = {
-    Color3.fromRGB(255, 238, 0), -- Vàng
-    Color3.fromRGB(0, 255, 255), -- Cyan Neon
-    Color3.fromRGB(0, 255, 128), -- Lá Neon
-    Color3.fromRGB(255, 60, 60),  -- Đỏ
-    Color3.fromRGB(220, 80, 255),-- Tím Hồng
-    Color3.fromRGB(255, 255, 255)-- Trắng
+    Color3.fromRGB(0, 255, 238), Color3.fromRGB(255, 238, 0), Color3.fromRGB(0, 255, 100),
+    Color3.fromRGB(255, 50, 80), Color3.fromRGB(200, 70, 255), Color3.fromRGB(255, 255, 255)
 }
 
 for _, color in ipairs(ColorsList) do
     local cBtn = Instance.new("TextButton", PaletteFrame)
     cBtn.BackgroundColor3 = color
     cBtn.Text = ""
-    Instance.new("UICorner", cBtn).CornerRadius = UDim.new(0, 6)
-    cBtn.MouseButton1Click:Connect(function()
-        Config.CurrentColor = color
-        ToggleStroke.Color = color
-    end)
+    Instance.new("UICorner", cBtn).CornerRadius = UDim.new(0, 5)
+    cBtn.MouseButton1Click:Connect(function() Config.CurrentColor = color; ToggleStroke.Color = color end)
 end
-
--- ==========================================
--- [ VÒNG LẶP CẬP NHẬT (RENDERSTEPPED) ]
--- ==========================================
-_G.BallTrackerConnection = RunService.RenderStepped:Connect(function()
-    -- 1. Kiểm tra tính năng Master & Team Sảnh
-    if not Config.MasterEnabled or (LocalPlayer.Team and LocalPlayer.Team.Name == Config.LobbyTeamName) then
-        hideAllVisuals()
-        return
-    end
-
-    local ball = Workspace:FindFirstChild("Ball")
-    if not ball or not ball:IsDescendantOf(Workspace) then
-        hideAllVisuals()
-        return
-    end
-
-    -- 2. Tính toán quỹ đạo đường đi & vị trí va chạm
-    local points, impacts = predictTrajectoryWithBounces(ball.Position, ball.AssemblyLinearVelocity)
-
-    -- 3. Render Đường Quỹ Đạo (Beams)
-    local beamIndex = 1
-    for i = 1, #points do
-        -- Nếu tắt tính năng nẩy, chỉ render đoạn quỹ đạo đầu tiên (trước khi va chạm lần 1)
-        if not Config.ShowBounceVisuals and #impacts > 0 and i > 2 then
-            local firstImpactTime = impacts[1].time / Config.TimeStep
-            if i > math.ceil(firstImpactTime) then break end
-        end
-
-        getOrCreateBeam(beamIndex)
-        AttachmentsPool[beamIndex].WorldPosition = points[i]
-        beamIndex = beamIndex + 1
-    end
-
-    -- Ẩn các Beam thừa
-    for i = beamIndex, #AttachmentsPool do
-        if AttachmentsPool[i] then AttachmentsPool[i].WorldPosition = Vector3.new(0, -1000, 0) end
-        if BeamsPool[i - 1] then BeamsPool[i - 1].Enabled = false end
-    end
-
-    -- 4. Render Ô Vị Trí Rơi & Đồng Hồ Đếm Ngược (ETA Timer)
-    local markerIdx = 1
-    for _, impact in ipairs(impacts) do
-        -- Lọc vị trí nẩy (Ví dụ: Chỉ render từ lần nẩy thứ 2 trở đi theo yêu cầu)
-        if impact.bounceIndex >= Config.MinBounceRender then
-            if Config.ShowLandingTimer then
-                local marker = getOrCreateMarker(markerIdx)
-                marker.Part.Position = impact.position
-                marker.Box.Adornee = marker.Part
-                marker.Gui.Enabled = true
-                marker.Text.Text = string.format("⏱️ %.2fs", impact.time)
-                markerIdx = markerIdx + 1
-            end
-        end
-    end
-
-    -- Ẩn các Marker thừa
-    for i = markerIdx, #MarkersPool do
-        MarkersPool[i].Part.Transparency = 1
-        MarkersPool[i].Gui.Enabled = false
-        MarkersPool[i].Box.Adornee = nil
-    end
-end)
