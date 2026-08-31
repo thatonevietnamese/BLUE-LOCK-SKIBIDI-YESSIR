@@ -12,7 +12,6 @@ local Config = {
 MasterEnabled = true,
 DrawAllBounces = false,
 
-```
 TrajectoryTime = 6.0,
 TimeStep = 0.03,
 BeamWidth = 0.35,
@@ -20,7 +19,6 @@ MaxBounces = 4,
 Elasticity = 0.75,
 
 CurrentColor = Color3.fromRGB(0, 255, 238)
-```
 
 }
 
@@ -61,9 +59,7 @@ pcall(function()
 _G.BallTrackerConnection:Disconnect()
 end)
 
-```
 _G.BallTrackerConnection = nil
-```
 
 end
 
@@ -72,9 +68,7 @@ pcall(function()
 _G.BallTrackerTeamConnection:Disconnect()
 end)
 
-```
 _G.BallTrackerTeamConnection = nil
-```
 
 end
 
@@ -84,7 +78,6 @@ end
 local function getVisualFolder()
 local folder = Workspace:FindFirstChild("TrajectoryVisuals")
 
-```
 if not folder then
     folder = Instance.new("Folder")
     folder.Name = "TrajectoryVisuals"
@@ -92,7 +85,6 @@ if not folder then
 end
 
 return folder
-```
 
 end
 
@@ -109,7 +101,6 @@ beam.Enabled = false
 end
 end
 
-```
 for _, attachment in pairs(AttachmentsPool) do
     if attachment and attachment.Parent then
         attachment.WorldPosition = Vector3.new(0, -10000, 0)
@@ -124,7 +115,6 @@ lastBallCheck = 0
 lastBallPos = nil
 lastBallTime = 0
 calculatedVelocity = Vector3.zero
-```
 
 end
 
@@ -134,13 +124,11 @@ end
 local function isLobbyTeam()
 local team = LocalPlayer.Team
 
-```
 if not team then
     return false
 end
 
 return string.lower(team.Name) == "lobby"
-```
 
 end
 
@@ -156,7 +144,6 @@ then
 return cachedBall
 end
 
-```
 cachedBall = nil
 
 local now = os.clock()
@@ -188,7 +175,6 @@ for _, name in ipairs(possibleNames) do
 end
 
 return nil
-```
 
 end
 
@@ -199,7 +185,6 @@ local function getEffectiveVelocity(ball)
 local now = os.clock()
 local currentPos = ball.Position
 
-```
 if lastBallPos and lastBallTime > 0 then
     local realDt = now - lastBallTime
 
@@ -234,7 +219,6 @@ if calculatedVelocity.Magnitude > 1.5 then
 end
 
 return Vector3.zero
-```
 
 end
 
@@ -247,7 +231,6 @@ getVisualFolder(),
 ball
 }
 
-```
 for _, player in ipairs(Players:GetPlayers()) do
     if player.Character then
         table.insert(ignoreList, player.Character)
@@ -259,7 +242,6 @@ if ball.Parent and ball.Parent:IsA("Model") then
 end
 
 raycastParams.FilterDescendantsInstances = ignoreList
-```
 
 end
 
@@ -269,7 +251,6 @@ end
 local function predictTrajectory(ball)
 table.clear(cachedPoints)
 
-```
 local firstImpactIndex = -1
 local currentVel = getEffectiveVelocity(ball)
 
@@ -298,7 +279,7 @@ do
     local nextPos =
         currentPos
         + currentVel * stepDt
-        \+ 0.5 * gravity * (stepDt ^ 2)
+        + 0.5 * gravity * (stepDt ^ 2)
 
     local direction = nextPos - currentPos
 
@@ -384,7 +365,6 @@ if bounceCount == 0 and #cachedPoints > 0 then
 end
 
 return cachedPoints, firstImpactIndex
-```
 
 end
 
@@ -394,7 +374,6 @@ end
 local function getOrCreateBeam(index)
 local targetFolder = getVisualFolder()
 
-```
 if AttachmentsPool[index]
     and not AttachmentsPool[index].Parent
 then
@@ -444,7 +423,6 @@ if beam then
     beam.Width1 = Config.BeamWidth
     beam.Enabled = true
 end
-```
 
 end
 
@@ -458,7 +436,6 @@ clearAndHideAll()
 return
 end
 
-```
 if not Config.MasterEnabled then
     clearAndHideAll()
     return
@@ -524,7 +501,6 @@ for i = beamIndex, #AttachmentsPool do
         beam.Enabled = false
     end
 end
-```
 
 end
 
@@ -535,11 +511,9 @@ _G.BallTrackerTeamConnection =
 LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
 isInLobby = isLobbyTeam()
 
-```
     -- Đổi team là clear ngay
     clearAndHideAll()
 end)
-```
 
 -- ==========================================
 -- [ TRẠNG THÁI BAN ĐẦU ]
@@ -651,7 +625,6 @@ if not dragging then
 return
 end
 
-```
 if input.UserInputType ~= Enum.UserInputType.MouseMovement
     and input.UserInputType ~= Enum.UserInputType.Touch
 then
@@ -668,7 +641,6 @@ MainFrame.Position =
         startPos.Y.Scale,
         startPos.Y.Offset + delta.Y
     )
-```
 
 end)
 
@@ -716,7 +688,6 @@ local function createToggle(text, defaultState, callback)
 local button = Instance.new("TextButton")
 button.Parent = MainFrame
 
-```
 button.Size =
     UDim2.new(0.92, 0, 0, 34)
 
@@ -764,7 +735,6 @@ end)
 updateVisual()
 
 return button
-```
 
 end
 
@@ -774,12 +744,10 @@ Config.MasterEnabled,
 function(state)
 Config.MasterEnabled = state
 
-```
     if not state then
         clearAndHideAll()
     end
 end
-```
 
 )
 
@@ -830,10 +798,8 @@ bounceModeBtn.MouseButton1Click:Connect(function()
 Config.DrawAllBounces =
 not Config.DrawAllBounces
 
-```
 updateBounceText()
 clearAndHideAll()
-```
 
 end)
 
@@ -902,7 +868,6 @@ for _, color in ipairs(ColorsList) do
 local colorButton =
 Instance.new("TextButton")
 
-```
 colorButton.Parent =
     PaletteFrame
 
@@ -932,7 +897,6 @@ colorButton.MouseButton1Click:Connect(function()
         end
     end
 end)
-```
 
 end
 
@@ -945,7 +909,6 @@ pcall(function()
 _G.BallTrackerConnection:Disconnect()
 end)
 
-```
     _G.BallTrackerConnection = nil
 end
 
@@ -956,6 +919,5 @@ if _G.BallTrackerTeamConnection then
 
     _G.BallTrackerTeamConnection = nil
 end
-```
 
 end)
