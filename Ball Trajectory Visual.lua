@@ -984,4 +984,3 @@ ScreenGui.Destroying:Connect(function()
         _G.BallTrackerTeamConnection = nil
     end
 end)
-```
