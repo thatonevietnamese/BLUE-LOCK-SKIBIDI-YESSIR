@@ -7,6 +7,7 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -22,6 +23,64 @@ local DEFAULT_CONTROL_KEY = Enum.KeyCode.F
 local DEFAULT_STEAL_DISTANCE = 3
 local SAE_PASS_HEIGHT = 300
 local SAE_PASS_SPEED = 260
+local DEFAULT_TP_TIME = 1.5
+
+--========================================================--
+-- SHOOT REMOTE
+--========================================================--
+
+local shootBallRemote = nil
+local shootEvent = nil
+local shootRemoteReady = false
+
+local function resolveShootRemotes()
+    local ok, mobileShoot, remote = pcall(function()
+        local events = ReplicatedStorage:FindFirstChild("Events")
+        if not events then return nil, nil end
+
+        local mobileButtons = events:FindFirstChild("MobileButtons")
+        local shoot = mobileButtons and mobileButtons:FindFirstChild("Shoot")
+        local shootBall = events:FindFirstChild("ShootBall")
+        return shoot, shootBall
+    end)
+
+    if ok then
+        shootEvent = mobileShoot
+        shootBallRemote = remote
+    else
+        shootEvent = nil
+        shootBallRemote = nil
+    end
+
+    shootRemoteReady = shootBallRemote ~= nil and shootBallRemote:IsA("RemoteEvent")
+    return shootEvent, shootBallRemote
+end
+
+resolveShootRemotes()
+
+local function fireShootRemote(direction, force, thirdArg)
+    if not shootRemoteReady or not shootBallRemote then
+        resolveShootRemotes()
+    end
+
+    if not shootRemoteReady or not shootBallRemote then
+        notify("SHOOT REMOTE", "Không tìm thấy Events.ShootBall", 1.6)
+        return false
+    end
+
+    if typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
+        return false
+    end
+
+    direction = direction.Unit
+    force = math.clamp(tonumber(force) or MIN_SPEED, MIN_SPEED, MAX_SPEED)
+
+    local ok = pcall(function()
+        shootBallRemote:FireServer(direction, force, thirdArg == nil and false or thirdArg)
+    end)
+
+    return ok
+end
 
 local mode = 1
 local controlKey = DEFAULT_CONTROL_KEY
@@ -39,12 +98,19 @@ local lastHolder = nil
 local lastOwnershipState = nil
 local lastControlPress = 0
 local stealCooldown = 0
+local mode5Primed = false
+local mode5ActionToken = 0
+local tpDuration = DEFAULT_TP_TIME
+local tpActive = false
+local tpStartedAt = 0
+local tpReturnCFrame = nil
 
 local modeSettings = {
     [1] = { speed = 60 },
     [2] = { speed = 60 },
     [3] = { speed = 60, height = 80, curve = 30 },
     [4] = { speed = 140 },
+    [5] = { speed = 140, height = 180 },
 }
 
 local keys = {W=false,A=false,S=false,D=false,Q=false,E=false}
@@ -373,8 +439,8 @@ end
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(350,390)
-main.Position = UDim2.new(0,25,0.5,-195)
+main.Size = UDim2.fromOffset(350,445)
+main.Position = UDim2.new(0,25,0.5,-222)
 main.BackgroundColor3 = Color3.fromRGB(24,24,29)
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -398,12 +464,14 @@ local stealButton = makeButton(main, "STEAL BALL: OFF", 10, 180, 160, 36)
 local saeButton = makeButton(main, "SAE PASS: OFF", 180, 180, 160, 36)
 local settingsButton = makeButton(main, "⚙ SETTINGS", 10, 224, 160, 36)
 local lockButton = makeButton(main, "LOCK PLAYER: OFF", 180, 224, 160, 36)
+local tpButton = makeButton(main, "TP RETURN", 10, 268, 230, 36)
+local tpTimeBox = makeBox(main, tpDuration, 250, 268, 90, 36)
 
 local info = makeLabel(main,
-    "Control key = nhấn để kích hoạt thao tác control / mode 3-4.\n" ..
+    "Control key = action cho mode 3/4/5; Mode 5 bấm 2 lần.\n" ..
     "WASDEQ: điều khiển khi mode 1/2 đang active.\n" ..
     "Sae Pass: giữ chuột trái + Control Key để chọn / chuyền.",
-    10, 270, 330, 88, 11)
+    10, 314, 330, 100, 11)
 info.TextWrapped = true
 info.TextYAlignment = Enum.TextYAlignment.Top
 info.TextColor3 = Color3.fromRGB(145,145,155)
@@ -434,7 +502,7 @@ notificationLayout.Parent = notificationHolder
 
 local settingsFrame = Instance.new("Frame")
 settingsFrame.Name = "Settings"
-settingsFrame.Size = UDim2.fromOffset(390,320)
+settingsFrame.Size = UDim2.fromOffset(490,320)
 settingsFrame.Position = UDim2.new(0,390,0.5,-160)
 settingsFrame.BackgroundColor3 = Color3.fromRGB(22,22,27)
 settingsFrame.BorderSizePixel = 0
@@ -445,10 +513,10 @@ stroke(settingsFrame, Color3.fromRGB(60,60,70), 0.15)
 
 local settingsTitle = makeLabel(settingsFrame, "⚙ BALL SETTINGS", 12, 8, 270, 32, 17)
 settingsTitle.Font = Enum.Font.GothamBold
-local closeSettings = makeButton(settingsFrame, "X", 350, 8, 28, 28)
+local closeSettings = makeButton(settingsFrame, "X", 450, 8, 28, 28)
 
 local tabs = {}
-local tabNames = {"MODE 1", "MODE 2", "MODE 3", "MODE 4"}
+local tabNames = {"MODE 1", "MODE 2", "MODE 3", "MODE 4", "MODE 5"}
 for i, name in ipairs(tabNames) do
     tabs[i] = makeButton(settingsFrame, name, 10 + (i-1)*94, 48, 86, 30)
 end
@@ -465,11 +533,13 @@ local heightLabel = makeLabel(settingsContent, "HEIGHT", 10, 56, 100, 25, 12)
 local curveLabel = makeLabel(settingsContent, "CURVE", 10, 106, 100, 25, 12)
 local heightBox = makeBox(settingsContent, modeSettings[3].height, 120, 52, 220, 32)
 local curveBox = makeBox(settingsContent, modeSettings[3].curve, 120, 102, 220, 32)
-local settingsHint = makeLabel(settingsContent, "", 10, 160, 350, 60, 11)
+local mode5HeightLabel = makeLabel(settingsContent, "HEIGHT / FORCE", 10, 56, 100, 25, 12)
+local mode5HeightBox = makeBox(settingsContent, modeSettings[5].height, 120, 52, 220, 32)
+local settingsHint = makeLabel(settingsContent, "", 10, 160, 430, 80, 11)
 settingsHint.TextWrapped = true
 settingsHint.TextColor3 = Color3.fromRGB(145,145,155)
 
-for i = 1,4 do
+for i = 1,5 do
     speedLabels[i] = makeLabel(settingsContent, "SPEED", 10, 10, 100, 25, 12)
     speedBoxes[i] = makeBox(settingsContent, modeSettings[i].speed, 120, 6, 220, 32)
     speedLabels[i].Visible = false
@@ -480,6 +550,8 @@ heightLabel.Visible = false
 curveLabel.Visible = false
 heightBox.Visible = false
 curveBox.Visible = false
+mode5HeightLabel.Visible = false
+mode5HeightBox.Visible = false
 
 local selectedSettingsTab = 1
 
@@ -495,15 +567,20 @@ local function parseSetting(box, oldValue, minValue, maxValue)
 end
 
 local function refreshSettingsPanel()
-    for i=1,4 do
+    for i=1,5 do
         speedLabels[i].Visible = (selectedSettingsTab == i)
         speedBoxes[i].Visible = (selectedSettingsTab == i)
     end
     local mode3 = selectedSettingsTab == 3
+    local mode5 = selectedSettingsTab == 5
+
     heightLabel.Visible = mode3
     curveLabel.Visible = mode3
     heightBox.Visible = mode3
     curveBox.Visible = mode3
+
+    mode5HeightLabel.Visible = mode5
+    mode5HeightBox.Visible = mode5
 
     if selectedSettingsTab == 1 then
         settingsHint.Text = "Mode 1: tốc độ chuyển động ngang + dọc của bóng theo WASDEQ."
@@ -513,10 +590,12 @@ local function refreshSettingsPanel()
         settingsHint.Text = "Mode 3: HEIGHT = bóng bay thẳng đứng lên tại vị trí sút; CURVE = độ cong quỹ đạo."
     elseif selectedSettingsTab == 4 then
         settingsHint.Text = "Mode 4: velocity được truyền một lần, sau đó script không can thiệp bóng nữa."
+    elseif selectedSettingsTab == 5 then
+        settingsHint.Text = "Mode 5: lần bấm đầu sút thẳng lên bằng HEIGHT/FORCE, lên tới đỉnh rồi đứng yên; lần bấm action tiếp theo mới phóng theo SPEED của Mode 5."
     end
 end
 
-for i=1,4 do
+for i=1,5 do
     tabs[i].MouseButton1Click:Connect(function()
         selectedSettingsTab = i
         refreshSettingsPanel()
@@ -528,6 +607,10 @@ end
 
 heightBox.FocusLost:Connect(function()
     modeSettings[3].height = parseSetting(heightBox, modeSettings[3].height, 0, 2000)
+end)
+
+mode5HeightBox.FocusLost:Connect(function()
+    modeSettings[5].height = parseSetting(mode5HeightBox, modeSettings[5].height, MIN_SPEED, MAX_SPEED)
 end)
 
 curveBox.FocusLost:Connect(function()
@@ -607,12 +690,13 @@ local function modeName()
     if mode == 1 then return "MODE 1 [CAMERA WASDEQ]" end
     if mode == 2 then return "MODE 2 [CAMERA]" end
     if mode == 3 then return "MODE 3 [EXTREME CURVE]" end
-    return "MODE 4 [RONALDO]"
+    if mode == 4 then return "MODE 4 [RONALDO]" end
+    return "MODE 5 [SKY WAIT]"
 end
 
 local function updateUI()
     controlButton.Text = "CONTROL KEY: " .. controlKey.Name
-    modeButton.Text = modeName()
+    modeButton.Text = modeName() .. (mode == 5 and mode5Primed and " [READY]" or "")
 
     if enabled then
         statusLabel.Text = "Status: ACTIVE"
@@ -838,50 +922,191 @@ local function controlMode2(ball)
     ball.AssemblyLinearVelocity = dir * modeSettings[2].speed
 end
 
-local function makeCurvedVelocity(ball)
-    camera = workspace.CurrentCamera
-    local origin = ball.Position
+local function makeMode3Direction(ball, launchForce)
     local direction = getCameraDirection()
-    local height = modeSettings[3].height
-    local curve = modeSettings[3].curve
-    local speed = modeSettings[3].speed
-
-    -- Điểm rơi nằm phía trước theo hướng camera. Height được dựng thẳng lên tại vị trí sút,
-    -- không lấy height theo chiều camera.
     local horizontalDir = Vector3.new(direction.X, 0, direction.Z)
+
     if horizontalDir.Magnitude < 0.001 then
-        horizontalDir = Vector3.new(0,0,-1)
+        horizontalDir = Vector3.new(0, 0, -1)
     else
         horizontalDir = horizontalDir.Unit
     end
 
-    local range = math.max(1, speed * 1.15)
-    local target = origin + horizontalDir * range
-    target += Vector3.new(0, height, 0)
+    local speed = math.max(launchForce or modeSettings[3].speed, MIN_SPEED)
+    local height = math.max(modeSettings[3].height, 0)
+    local curve = modeSettings[3].curve
 
-    local toTarget = target - origin
-    local distance = toTarget.Magnitude
-    local base = toTarget.Unit * speed
+    -- Tính thành phần thẳng đứng từ độ cao cực đại:
+    -- h ≈ vy² / (2g). Đây là prediction ở client; server vẫn là nguồn physics cuối cùng.
+    local gravity = math.max(workspace.Gravity, 0)
+    local verticalSpeed = 0
 
-    -- Curve tạo thành phần ngang vuông góc với hướng camera + một thành phần rơi/chống rơi.
+    if gravity > 0 and height > 0 then
+        verticalSpeed = math.sqrt(2 * gravity * height)
+    end
+
+    verticalSpeed = math.min(verticalSpeed, speed * 0.92)
+
+    local horizontalSpeed = math.sqrt(math.max(speed * speed - verticalSpeed * verticalSpeed, 0))
+
+    -- Curve được mã hóa thành thành phần ngang vuông góc với hướng camera.
+    -- Giá trị lớn hơn -> quỹ đạo lệch ngang mạnh hơn.
     local side = Vector3.new(-horizontalDir.Z, 0, horizontalDir.X)
-    local curveVector = side * curve
-    return base + curveVector
+    local curveTime = math.max(modeSettings[3].speed > 0 and 0.8 or 1, 0.2)
+    local sideSpeed = curve / curveTime
+
+    local launchVector =
+        horizontalDir * horizontalSpeed
+        + side * sideSpeed
+        + Vector3.new(0, verticalSpeed, 0)
+
+    if launchVector.Magnitude < 0.001 then
+        return direction
+    end
+
+    return launchVector.Unit
 end
 
 local function performMode3Kick(ball)
     if not ball then return end
-    local velocity = makeCurvedVelocity(ball)
-    ball.AssemblyLinearVelocity = velocity
-    notify("MODE 3", string.format("Height %.1f / Curve %.1f", modeSettings[3].height, modeSettings[3].curve), 1.8)
+
+    local gravity = math.max(workspace.Gravity, 0)
+    local requestedHeight = math.max(modeSettings[3].height, 0)
+    local requiredVerticalSpeed = 0
+
+    if gravity > 0 and requestedHeight > 0 then
+        requiredVerticalSpeed = math.sqrt(2 * gravity * requestedHeight)
+    end
+
+    -- Force is the launch speed sent to the server. It must be high enough
+    -- to make the requested HEIGHT physically possible.
+    local force = math.clamp(
+        math.max(modeSettings[3].speed, requiredVerticalSpeed, MIN_SPEED),
+        MIN_SPEED,
+        MAX_SPEED
+    )
+
+    local direction = makeMode3Direction(ball, force)
+
+    if fireShootRemote(direction, force, false) then
+        notify(
+            "MODE 3",
+            string.format(
+                "Height %.1f / Curve %.1f / Force %.1f",
+                modeSettings[3].height,
+                modeSettings[3].curve,
+                force
+            ),
+            1.8
+        )
+    end
 end
 
 local function performMode4Kick(ball)
     if not ball then return end
+
     local direction = getCameraDirection()
-    ball.AssemblyLinearVelocity = direction * modeSettings[4].speed
-    -- Không có loop điều chỉnh sau cú này.
-    notify("RONALDO MODE", "Velocity sent — no follow-up control", 1.8)
+    local force = math.clamp(modeSettings[4].speed, MIN_SPEED, MAX_SPEED)
+
+    if fireShootRemote(direction, force, false) then
+        -- FireServer một lần duy nhất. Không có loop chỉnh velocity sau đó.
+        notify("RONALDO MODE", "ShootBall velocity sent", 1.8)
+    end
+end
+
+
+local function resetMode5State()
+    mode5Primed = false
+    mode5ActionToken += 1
+end
+
+local function performMode5Action(ball)
+    if not ball then return end
+
+    if not localHasBall() then
+        notify("MODE 5", "Cần đang cầm bóng", 1.4)
+        return
+    end
+
+    if not mode5Primed then
+        local force = math.clamp(
+            modeSettings[5].height,
+            MIN_SPEED,
+            MAX_SPEED
+        )
+
+        local upward = Vector3.new(0, 1, 0)
+
+        -- Giữ cơ chế shoot event/remote đang có:
+        -- force của remote chính là HEIGHT/FORCE của Mode 5.
+        local fired = fireShootRemote(upward, force, false)
+
+        if not fired then
+            -- Không chặn fallback local khi remote không có.
+            ball.AssemblyLinearVelocity =
+                Vector3.new(0, force, 0)
+        else
+            -- Client vẫn giữ quyền điều khiển velocity của ball.
+            ball.AssemblyLinearVelocity =
+                Vector3.new(0, force, 0)
+        end
+
+        mode5Primed = true
+        mode5ActionToken += 1
+
+        local token = mode5ActionToken
+        local gravity = math.max(Workspace.Gravity, 0)
+
+        if gravity > 0 then
+            local apexTime = force / gravity
+
+            task.delay(math.max(apexTime, 0.05), function()
+                if token ~= mode5ActionToken then
+                    return
+                end
+
+                if not ball or not ball.Parent then
+                    return
+                end
+
+                if localHasBall() then
+                    return
+                end
+
+                -- Đứng yên ở gần đỉnh.
+                ball.AssemblyLinearVelocity = Vector3.zero
+            end)
+        else
+            -- 0 gravity: giữ nguyên trạng thái đứng yên theo yêu cầu.
+            ball.AssemblyLinearVelocity = Vector3.zero
+        end
+
+        notify(
+            "MODE 5",
+            string.format("UP: %.1f  →  bấm %s lần nữa để phóng", force, controlKey.Name),
+            2.2
+        )
+
+        return
+    end
+
+    -- Lần bấm thứ hai: phóng theo SPEED của Mode 5.
+    local direction = getCameraDirection()
+    local speed = math.clamp(
+        modeSettings[5].speed,
+        MIN_SPEED,
+        MAX_SPEED
+    )
+
+    mode5ActionToken += 1
+    ball.AssemblyLinearVelocity = direction * speed
+    mode5Primed = false
+
+    notify(
+        "MODE 5",
+        string.format("LAUNCH SPEED: %.1f", speed),
+        1.7
+    )
 end
 
 local function performControlAction()
@@ -912,6 +1137,8 @@ local function performControlAction()
         else
             notify("MODE 4", "Cần đang cầm bóng", 1.4)
         end
+    elseif mode == 5 then
+        performMode5Action(ball)
     end
 end
 
@@ -947,6 +1174,7 @@ end
 
 local function executeSaePass()
     if not saePassEnabled then return end
+
     if not selectedTarget or not getPlayerRoot(selectedTarget) then
         clearTarget()
         notify("SAE PASS", "Không còn target hợp lệ", 1.4)
@@ -956,8 +1184,7 @@ local function executeSaePass()
     local state, holder, ball = getBallState()
     if not ball then return end
 
-    -- Chỉ thực hiện cú Sae Pass khi local player thực sự đang giữ bóng.
-    -- Đây chính là trường hợp holder == player; không được return ở đây.
+    -- holder == player là điều kiện để thực hiện pass; không được return ở đây.
     if holder ~= player then
         notify("SAE PASS", "Bạn phải đang cầm bóng để thực hiện Sae Pass", 1.4)
         return
@@ -969,18 +1196,37 @@ local function executeSaePass()
         return
     end
 
-    local startPosition = ball.Position
+    local origin = ball.Position
+    local height = SAE_PASS_HEIGHT
+    local gravity = math.max(workspace.Gravity, 0)
+
+    -- Pha 1: yêu cầu server phóng bóng thẳng đứng.
+    -- Lực được tính từ h ≈ v²/(2g).
+    local upwardForce = SAE_PASS_SPEED
+    if gravity > 0 then
+        upwardForce = math.sqrt(2 * gravity * height)
+    end
+    upwardForce = math.clamp(upwardForce, MIN_SPEED, MAX_SPEED)
+
     saePassActive = true
 
-    -- Giai đoạn 1: bóng đi thẳng đứng lên đúng ~300 studs tại vị trí sút.
-    ball.CFrame = CFrame.new(startPosition + Vector3.new(0, SAE_PASS_HEIGHT, 0))
-    ball.AssemblyLinearVelocity = Vector3.zero
+    if not fireShootRemote(Vector3.new(0, 1, 0), upwardForce, false) then
+        saePassActive = false
+        return
+    end
 
     notify("SAE PASS", "Ball launched upward → " .. selectedTarget.Name, 1.5)
 
-    -- Giai đoạn 2: sau khi lên cao, chuyển bóng tới đúng phía trên đầu target
-    -- rồi để hệ thống Sae Pass tiếp tục điều khiển nó lao xuống target.
-    task.delay(0.12, function()
+    -- Lưu ý: ShootBall là RemoteEvent cho cú sút từ client.
+    -- Sau khi bóng đã rời player, remote này không cung cấp API để
+    -- teleport/redirect bóng giữa không trung. Vì vậy pha 2 vẫn dùng
+    -- local steering như bản cũ; server có thể ghi đè nếu game kiểm soát nghiêm.
+    local apexDelay = 0.22
+    if gravity > 0 then
+        apexDelay = math.max(0.22, upwardForce / gravity)
+    end
+
+    task.delay(apexDelay, function()
         if not saePassActive or not selectedTarget or not ball or not ball.Parent then
             return
         end
@@ -991,15 +1237,19 @@ local function executeSaePass()
             return
         end
 
-        local targetAbove = currentTargetRoot.Position + Vector3.new(0, SAE_PASS_HEIGHT, 0)
-        ball.CFrame = CFrame.new(targetAbove)
-
+        local targetAbove = currentTargetRoot.Position + Vector3.new(0, height, 0)
         local desired = currentTargetRoot.Position + Vector3.new(0, 2.5, 0)
-        local delta = desired - ball.Position
-        if delta.Magnitude > 0 then
-            ball.AssemblyLinearVelocity = delta.Unit * SAE_PASS_SPEED
-        else
-            ball.AssemblyLinearVelocity = Vector3.zero
+        local delta = desired - targetAbove
+
+        -- Chỉ đưa ball tới vùng target bằng local physics nếu client còn quyền điều khiển.
+        if ball:IsA("BasePart") then
+            ball.CFrame = CFrame.new(targetAbove)
+
+            if delta.Magnitude > 0 then
+                ball.AssemblyLinearVelocity = delta.Unit * SAE_PASS_SPEED
+            else
+                ball.AssemblyLinearVelocity = Vector3.zero
+            end
         end
     end)
 end
@@ -1029,6 +1279,83 @@ local function handleControlKeyPressed()
 end
 
 --========================================================--
+-- TEMPORARY TP
+--========================================================--
+
+local function restoreTemporaryTP(reason)
+    if not tpActive then
+        return
+    end
+
+    local saved = tpReturnCFrame
+    tpActive = false
+    tpReturnCFrame = nil
+
+    if saved and updateCharacter() and rootPart then
+        rootPart.CFrame = saved
+    end
+
+    if reason then
+        notify("TP RETURN", reason, 1.3)
+    end
+end
+
+local function startTemporaryTP()
+    if tpActive then
+        restoreTemporaryTP("Đã hoàn trả vị trí")
+        return
+    end
+
+    if not updateCharacter() or not rootPart then
+        notify("TP RETURN", "Không tìm thấy nhân vật", 1.4)
+        return
+    end
+
+    local state, holder, ball = getBallState()
+
+    if state ~= "HELD" or not holder then
+        notify("TP RETURN", "Bóng không do đối thủ cầm", 1.4)
+        return
+    end
+
+    if holder == player then
+        -- Khi bóng đã thuộc local player: quay về ngay nếu đang có điểm lưu.
+        if tpReturnCFrame then
+            restoreTemporaryTP("Ball is yours — returned immediately")
+        else
+            notify("TP RETURN", "Ball is already yours", 1.3)
+        end
+        return
+    end
+
+    if sameTeam(holder) then
+        notify("TP RETURN", "Holder là đồng đội, không TP", 1.4)
+        return
+    end
+
+    local targetRoot = getPlayerRoot(holder)
+
+    if not targetRoot then
+        notify("TP RETURN", "Không tìm thấy vị trí holder", 1.4)
+        return
+    end
+
+    tpReturnCFrame = rootPart.CFrame
+    tpActive = true
+    tpStartedAt = os.clock()
+
+    rootPart.CFrame =
+        targetRoot.CFrame
+        + Vector3.new(0, DEFAULT_STEAL_DISTANCE, 0)
+
+    notify(
+        "TP RETURN",
+        string.format("TP tới %s trong %.2fs", holder.Name, tpDuration),
+        1.7
+    )
+end
+
+--========================================================--
 -- BUTTON EVENTS
 --========================================================--
 
@@ -1040,9 +1367,11 @@ end)
 
 modeButton.MouseButton1Click:Connect(function()
     mode += 1
-    if mode > 4 then mode = 1 end
+    if mode > 5 then mode = 1 end
 
-    if mode == 3 or mode == 4 then
+    resetMode5State()
+
+    if mode == 3 or mode == 4 or mode == 5 then
         -- Hai mode kick không cần anchor.
         if rootPart then rootPart.Anchored = false end
         unlockPlayer()
@@ -1096,6 +1425,21 @@ lockButton.MouseButton1Click:Connect(function()
         applyModeLock()
     end
     updateUI()
+end)
+
+tpTimeBox.FocusLost:Connect(function()
+    local value = tonumber(tpTimeBox.Text)
+    if not value then
+        tpTimeBox.Text = tostring(tpDuration)
+        return
+    end
+
+    tpDuration = math.clamp(value, 0.1, 60)
+    tpTimeBox.Text = tostring(tpDuration)
+end)
+
+tpButton.MouseButton1Click:Connect(function()
+    startTemporaryTP()
 end)
 
 --========================================================--
@@ -1195,6 +1539,15 @@ RunService.Heartbeat:Connect(function(dt)
         lastHolder = holder
     end
 
+    if tpActive then
+        local tpState, tpHolder = getBallState()
+        if tpState == "HELD" and tpHolder == player then
+            restoreTemporaryTP("Ball is yours — returned immediately")
+        elseif os.clock() - tpStartedAt >= tpDuration then
+            restoreTemporaryTP("TP timer expired")
+        end
+    end
+
     if stealBallEnabled then
         stealCooldown += dt
         if stealCooldown >= 0.025 then
@@ -1256,6 +1609,9 @@ player.CharacterAdded:Connect(function()
     playerWasLocked = false
     savedWalkSpeed, savedJumpPower, savedAutoRotate = nil, nil, nil
     clearTarget()
+    resetMode5State()
+    tpActive = false
+    tpReturnCFrame = nil
 
     if enabled and (mode == 1 or mode == 2) and anchorEnabled then
         applyModeLock()
@@ -1273,5 +1629,12 @@ end)
 
 refreshSettingsPanel()
 updateUI()
+
+if shootRemoteReady then
+    notify("SHOOT REMOTE", "ShootBall detected", 1.8)
+else
+    notify("SHOOT REMOTE", "Events.ShootBall chưa tìm thấy", 2.2)
+end
+
 notify("BALL CONTROLLER", "V3 loaded", 1.8)
 print("[Ball Controller V3] loaded")
