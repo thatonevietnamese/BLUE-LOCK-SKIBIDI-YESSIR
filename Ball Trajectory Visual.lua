@@ -7,12 +7,11 @@ local LocalPlayer = Players.LocalPlayer
 local GuiParent = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ==========================================
--- [ CẤU HÌNH HỆ THỐNG ]
+-- [ CONFIGURATION ]
 -- ==========================================
 local Config = {
     MasterEnabled = true,
 
-    -- Giữ prediction cũ làm lớp phụ
     DrawTrajectory = true,
     DrawAllBounces = false,
 
@@ -22,35 +21,21 @@ local Config = {
     MaxBounces = 4,
     Elasticity = 0.75,
 
-    -- ==============================
-    -- DIRECTION ARROW
-    -- ==============================
-
     ShowDirectionArrow = true,
-
-    -- Tốc độ tối thiểu để arrow xuất hiện
     MinArrowSpeed = 2,
-
-    -- Độ dài arrow theo tốc độ
     ArrowScale = 0.12,
-
-    -- Giới hạn arrow
     MinArrowLength = 3,
     MaxArrowLength = 90,
-
     ArrowWidth = 0.55,
 
-    -- Làm mượt tốc độ
     SpeedSmoothing = 0.25,
-
-    -- Khoảng thời gian giữa 2 lần lấy mẫu chuyển động
     VelocitySampleInterval = 0.06,
 
     CurrentColor = Color3.fromRGB(0, 255, 238)
 }
 
 -- ==========================================
--- [ BIẾN & CACHE ]
+-- [ STATE & CACHE ]
 -- ==========================================
 
 local cachedPoints = {}
@@ -61,12 +46,12 @@ raycastParams.RespectCanCollide = true
 
 local cachedBall = nil
 local lastBallCheck = 0
+local BALL_SCAN_INTERVAL = 0.15
 
-local isInLobby = false
-
--- ==========================================
--- [ MOVEMENT ESTIMATION ]
--- ==========================================
+local cachedHolder = nil
+local cachedHeldBall = nil
+local lastHolderCheck = 0
+local HOLDER_SCAN_INTERVAL = 0.10
 
 local lastObservedPosition = nil
 local lastObservedTime = 0
@@ -76,15 +61,26 @@ local smoothedHorizontalVelocity = Vector3.zero
 
 local lastVelocitySampleTime = 0
 
--- Dùng khi bóng đang nằm trong character
 local heldDirection = Vector3.zero
 local heldSpeed = 0
 
 local currentHolder = nil
 local previousHolder = nil
 
+local isInLobby = false
+
 -- ==========================================
--- [ GUI PARENT ]
+-- [ RAYCAST FILTER CACHE ]
+-- ==========================================
+
+local lastFilterUpdate = 0
+local FILTER_UPDATE_INTERVAL = 0.50
+local filterDirty = true
+local lastFilteredBall = nil
+local lastFilteredPlayerCount = 0
+
+-- ==========================================
+-- [ GUI CLEANUP ]
 -- ==========================================
 
 local oldGui = GuiParent:FindFirstChild("BallTrackerUI")
@@ -92,10 +88,6 @@ local oldGui = GuiParent:FindFirstChild("BallTrackerUI")
 if oldGui then
     oldGui:Destroy()
 end
-
--- ==========================================
--- [ DỌN SCRIPT CŨ ]
--- ==========================================
 
 if _G.BallTrackerConnection then
     pcall(function()
@@ -130,7 +122,7 @@ local function getVisualFolder()
 end
 
 -- ==========================================
--- [ POOL ]
+-- [ VISUAL POOLS ]
 -- ==========================================
 
 local AttachmentsPool = {}
@@ -158,10 +150,14 @@ local function resetMovementCache()
 
     currentHolder = nil
     previousHolder = nil
+
+    cachedHolder = nil
+    cachedHeldBall = nil
+    lastHolderCheck = 0
 end
 
 -- ==========================================
--- [ CLEAR VISUAL ]
+-- [ CLEAR VISUALS ]
 -- ==========================================
 
 local function clearAndHideAll()
@@ -198,7 +194,7 @@ local function clearAndHideAll()
 end
 
 -- ==========================================
--- [ CHECK LOBBY ]
+-- [ LOBBY CHECK ]
 -- ==========================================
 
 local function isLobbyTeam()
@@ -212,7 +208,7 @@ local function isLobbyTeam()
 end
 
 -- ==========================================
--- [ FIND BALL ]
+-- [ FIND ACTIVE BALL ]
 -- ==========================================
 
 local function getActiveBall()
@@ -224,15 +220,14 @@ local function getActiveBall()
         return cachedBall
     end
 
-    cachedBall = nil
-
     local now = os.clock()
 
-    if now - lastBallCheck < 0.15 then
+    if now - lastBallCheck < BALL_SCAN_INTERVAL then
         return nil
     end
 
     lastBallCheck = now
+    cachedBall = nil
 
     local possibleNames = {
         "Ball",
@@ -260,42 +255,93 @@ end
 -- ==========================================
 -- [ FIND BALL HOLDER ]
 -- ==========================================
+-- This function is deliberately cached/throttled.
+-- It does not recursively scan every character every frame.
 
-local function findBallHolder()
+local function scanBallHolder()
+    local possibleNames = {
+        "Ball",
+        "SoccerBall",
+        "Football",
+        "TPSBall",
+        "TpsBall"
+    }
+
     for _, player in ipairs(Players:GetPlayers()) do
         local character = player.Character
 
         if character then
-            local ball =
-                character:FindFirstChild("Ball", true)
+            -- Fast path: equipped Tool / Handle / Ball.
+            local tool = character:FindFirstChildOfClass("Tool")
 
-            if ball
-                and ball:IsA("BasePart")
-            then
-                return player, ball
+            if tool then
+                local handle = tool:FindFirstChild("Handle")
+                if handle and handle:IsA("BasePart") then
+                    return player, handle
+                end
+
+                local toolBall = tool:FindFirstChild("Ball")
+                if toolBall and toolBall:IsA("BasePart") then
+                    return player, toolBall
+                end
             end
 
-            local possibleNames = {
-                "SoccerBall",
-                "Football",
-                "TPSBall",
-                "TpsBall"
-            }
-
+            -- Fast path: immediate children only.
             for _, name in ipairs(possibleNames) do
-                local alternateBall =
-                    character:FindFirstChild(name, true)
+                local alternateBall = character:FindFirstChild(name)
 
-                if alternateBall
-                    and alternateBall:IsA("BasePart")
-                then
+                if alternateBall and alternateBall:IsA("BasePart") then
                     return player, alternateBall
                 end
             end
         end
     end
 
+    -- Slow fallback:
+    -- Some games place the Ball deeper inside the character.
+    -- This is still throttled by HOLDER_SCAN_INTERVAL.
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player.Character
+
+        if character then
+            for _, name in ipairs(possibleNames) do
+                local nestedBall = character:FindFirstChild(name, true)
+
+                if nestedBall and nestedBall:IsA("BasePart") then
+                    return player, nestedBall
+                end
+            end
+        end
+    end
+
     return nil, nil
+end
+
+local function findBallHolder()
+    local now = os.clock()
+
+    if cachedHolder
+        and cachedHolder.Parent == Players
+        and cachedHolder.Character
+        and cachedHeldBall
+        and cachedHeldBall.Parent
+        and cachedHeldBall:IsA("BasePart")
+    then
+        if now - lastHolderCheck < HOLDER_SCAN_INTERVAL then
+            return cachedHolder, cachedHeldBall
+        end
+    elseif now - lastHolderCheck < HOLDER_SCAN_INTERVAL then
+        return nil, nil
+    end
+
+    lastHolderCheck = now
+
+    local holder, heldBall = scanBallHolder()
+
+    cachedHolder = holder
+    cachedHeldBall = heldBall
+
+    return holder, heldBall
 end
 
 -- ==========================================
@@ -325,70 +371,57 @@ local function getHolderDirection(holder)
         return Vector3.zero
     end
 
-    local hrp =
-        character:FindFirstChild("HumanoidRootPart")
+    local hrp = character:FindFirstChild("HumanoidRootPart")
 
     if not hrp then
         return Vector3.zero
     end
 
-    local look =
-        Vector3.new(
-            hrp.CFrame.LookVector.X,
-            0,
-            hrp.CFrame.LookVector.Z
-        )
+    local look = Vector3.new(
+        hrp.CFrame.LookVector.X,
+        0,
+        hrp.CFrame.LookVector.Z
+    )
 
     return safeUnit(look)
 end
 
 -- ==========================================
--- [ UPDATE MOVEMENT ESTIMATION ]
+-- [ MOVEMENT ESTIMATION ]
 -- ==========================================
 
 local function updateMovementEstimate(ball, holder)
     local now = os.clock()
     local currentPos = ball.Position
 
-    -- ==========================================
-    -- ĐANG CẦM BÓNG
-    -- ==========================================
+    -- Held ball: use holder orientation as predicted direction.
     if holder then
-
-        local direction =
-            getHolderDirection(holder)
+        local direction = getHolderDirection(holder)
 
         if direction.Magnitude > 0 then
             heldDirection = direction
         end
 
-        -- Nếu có hướng dịch chuyển của holder,
-        -- lấy magnitude làm tốc độ tham khảo.
         local character = holder.Character
 
         if character then
-            local hrp =
-                character:FindFirstChild("HumanoidRootPart")
+            local hrp = character:FindFirstChild("HumanoidRootPart")
 
             if hrp then
-                local holderVelocity =
-                    hrp.AssemblyLinearVelocity
+                local holderVelocity = hrp.AssemblyLinearVelocity
 
-                local horizontalSpeed =
-                    Vector3.new(
-                        holderVelocity.X,
-                        0,
-                        holderVelocity.Z
-                    ).Magnitude
+                local horizontalSpeed = Vector3.new(
+                    holderVelocity.X,
+                    0,
+                    holderVelocity.Z
+                ).Magnitude
 
                 if horizontalSpeed > 0 then
-                    heldSpeed =
-                        horizontalSpeed
+                    heldSpeed = horizontalSpeed
                 end
             end
         end
 
-        -- Cố định direction vào hướng holder
         smoothedHorizontalVelocity =
             heldDirection * math.max(heldSpeed, 1)
 
@@ -400,10 +433,7 @@ local function updateMovementEstimate(ball, holder)
         return
     end
 
-    -- ==========================================
-    -- BÓNG TỰ DO
-    -- ==========================================
-
+    -- Free ball: estimate movement from observed position changes.
     if not lastObservedPosition then
         lastObservedPosition = currentPos
         lastObservedTime = now
@@ -414,38 +444,30 @@ local function updateMovementEstimate(ball, holder)
         return
     end
 
-    local dt =
-        now - lastObservedTime
+    local dt = now - lastObservedTime
 
     if dt <= 0 then
         return
     end
 
-    local displacement =
-        currentPos - lastObservedPosition
-
-    local measuredVelocity =
-        displacement / dt
+    local displacement = currentPos - lastObservedPosition
+    local measuredVelocity = displacement / dt
 
     estimatedVelocity = measuredVelocity
 
-    local horizontalVelocity =
-        Vector3.new(
-            measuredVelocity.X,
-            0,
-            measuredVelocity.Z
-        )
+    local horizontalVelocity = Vector3.new(
+        measuredVelocity.X,
+        0,
+        measuredVelocity.Z
+    )
 
     if horizontalVelocity.Magnitude > Config.MinArrowSpeed then
-
         smoothedHorizontalVelocity =
             smoothedHorizontalVelocity:Lerp(
                 horizontalVelocity,
                 Config.SpeedSmoothing
             )
     else
-
-        -- Khi bóng giảm tốc mạnh
         smoothedHorizontalVelocity =
             smoothedHorizontalVelocity:Lerp(
                 Vector3.zero,
@@ -459,7 +481,7 @@ local function updateMovementEstimate(ball, holder)
 end
 
 -- ==========================================
--- [ GET CURRENT HORIZONTAL MOVEMENT ]
+-- [ CURRENT HORIZONTAL VELOCITY ]
 -- ==========================================
 
 local function getCurrentHorizontalVelocity()
@@ -470,7 +492,30 @@ end
 -- [ RAYCAST FILTER ]
 -- ==========================================
 
+local function markRaycastFilterDirty()
+    filterDirty = true
+end
+
 local function updateRaycastFilter(ball)
+    local now = os.clock()
+    local playerCount = #Players:GetPlayers()
+
+    local forceUpdate =
+        filterDirty
+        or ball ~= lastFilteredBall
+        or playerCount ~= lastFilteredPlayerCount
+
+    if not forceUpdate
+        and now - lastFilterUpdate < FILTER_UPDATE_INTERVAL
+    then
+        return
+    end
+
+    lastFilterUpdate = now
+    lastFilteredBall = ball
+    lastFilteredPlayerCount = playerCount
+    filterDirty = false
+
     local ignoreList = {
         getVisualFolder(),
         ball
@@ -478,24 +523,15 @@ local function updateRaycastFilter(ball)
 
     for _, player in ipairs(Players:GetPlayers()) do
         if player.Character then
-            table.insert(
-                ignoreList,
-                player.Character
-            )
+            table.insert(ignoreList, player.Character)
         end
     end
 
-    if ball.Parent
-        and ball.Parent:IsA("Model")
-    then
-        table.insert(
-            ignoreList,
-            ball.Parent
-        )
+    if ball.Parent and ball.Parent:IsA("Model") then
+        table.insert(ignoreList, ball.Parent)
     end
 
-    raycastParams.FilterDescendantsInstances =
-        ignoreList
+    raycastParams.FilterDescendantsInstances = ignoreList
 end
 
 -- ==========================================
@@ -507,83 +543,46 @@ local function predictTrajectory(ball)
 
     local firstImpactIndex = -1
 
-    local horizontalVelocity =
-        getCurrentHorizontalVelocity()
-
-    local holder =
-        currentHolder
-
+    local holder = currentHolder
     local initialVelocity = Vector3.zero
 
-    -- ==========================================
-    -- HOLDER
-    -- ==========================================
-
     if holder then
-
-        local direction =
-            getHolderDirection(holder)
+        local direction = getHolderDirection(holder)
 
         if direction.Magnitude > 0 then
             initialVelocity =
                 direction * math.max(heldSpeed, 1)
         end
-
     else
-
-        -- ==========================================
-        -- FREE BALL
-        -- ==========================================
-
-        initialVelocity =
-            estimatedVelocity
-
+        initialVelocity = estimatedVelocity
     end
 
     if initialVelocity.Magnitude < 1.2 then
         return cachedPoints, firstImpactIndex
     end
 
-    local currentPos =
-        ball.Position
+    local currentPos = ball.Position
 
-    local gravityValue =
-        Workspace.Gravity > 0
-        and Workspace.Gravity
-        or 196.2
-
-    local gravity =
-        Vector3.new(
-            0,
-            -gravityValue,
-            0
-        )
+    -- Use the game's actual gravity, including 0 gravity.
+    local gravityValue = Workspace.Gravity
+    local gravity = Vector3.new(0, -gravityValue, 0)
 
     local totalTime = 0
     local stepDt = Config.TimeStep
     local bounceCount = 0
+    local currentVel = initialVelocity
 
-    local currentVel =
-        initialVelocity
-
-    table.insert(
-        cachedPoints,
-        currentPos
-    )
+    table.insert(cachedPoints, currentPos)
 
     while totalTime < Config.TrajectoryTime
         and bounceCount < Config.MaxBounces
     do
-
         local nextPos =
             currentPos
             + currentVel * stepDt
-            + 0.5
-            * gravity
-            * (stepDt ^ 2)
+            + 0.5 * gravity * (stepDt ^ 2)
 
-        local direction =
-            nextPos - currentPos
+        local direction = nextPos - currentPos
 
         local rayResult =
             Workspace:Raycast(
@@ -593,40 +592,28 @@ local function predictTrajectory(ball)
             )
 
         if rayResult then
-
             bounceCount += 1
 
-            local hitPos =
-                rayResult.Position
+            local hitPos = rayResult.Position
+            local hitNormal = rayResult.Normal
 
-            local hitNormal =
-                rayResult.Normal
-
-            local stepDistance =
-                direction.Magnitude
-
-            local actualDistance =
-                (hitPos - currentPos).Magnitude
+            local stepDistance = direction.Magnitude
+            local actualDistance = (hitPos - currentPos).Magnitude
 
             local fraction =
                 stepDistance > 0
                 and actualDistance / stepDistance
                 or 1
 
-            table.insert(
-                cachedPoints,
-                hitPos
-            )
+            table.insert(cachedPoints, hitPos)
 
             if bounceCount == 1 then
-                firstImpactIndex =
-                    #cachedPoints
+                firstImpactIndex = #cachedPoints
             end
 
             local velocityAtImpact =
                 currentVel
-                + gravity
-                * (stepDt * fraction)
+                + gravity * (stepDt * fraction)
 
             currentVel =
                 (
@@ -641,17 +628,13 @@ local function predictTrajectory(ball)
                 hitPos
                 + hitNormal * 0.08
 
-            totalTime +=
-                stepDt * fraction
+            totalTime += stepDt * fraction
 
             if currentVel.Magnitude < 1.5 then
                 break
             end
-
         else
-
-            currentPos =
-                nextPos
+            currentPos = nextPos
 
             currentVel =
                 currentVel
@@ -659,43 +642,24 @@ local function predictTrajectory(ball)
 
             totalTime += stepDt
 
-            table.insert(
-                cachedPoints,
-                currentPos
-            )
+            table.insert(cachedPoints, currentPos)
         end
     end
 
-    -- ==========================================
-    -- DOWN RAY
-    -- ==========================================
-
-    if bounceCount == 0
-        and #cachedPoints > 0
-    then
-
-        local lastPoint =
-            cachedPoints[#cachedPoints]
+    -- Downward ground ray only when there was no bounce.
+    if bounceCount == 0 and #cachedPoints > 0 then
+        local lastPoint = cachedPoints[#cachedPoints]
 
         local downRay =
             Workspace:Raycast(
                 lastPoint,
-                Vector3.new(
-                    0,
-                    -500,
-                    0
-                ),
+                Vector3.new(0, -500, 0),
                 raycastParams
             )
 
         if downRay then
-            table.insert(
-                cachedPoints,
-                downRay.Position
-            )
-
-            firstImpactIndex =
-                #cachedPoints
+            table.insert(cachedPoints, downRay.Position)
+            firstImpactIndex = #cachedPoints
         end
     end
 
@@ -703,13 +667,11 @@ local function predictTrajectory(ball)
 end
 
 -- ==========================================
--- [ TRAJECTORY BEAM ]
+-- [ GET / CREATE TRAJECTORY BEAM ]
 -- ==========================================
 
 local function getOrCreateBeam(index)
-
-    local targetFolder =
-        getVisualFolder()
+    local targetFolder = getVisualFolder()
 
     if AttachmentsPool[index]
         and not AttachmentsPool[index].Parent
@@ -725,139 +687,82 @@ local function getOrCreateBeam(index)
     end
 
     if not AttachmentsPool[index] then
+        local attachment = Instance.new("Attachment")
 
-        local attachment =
-            Instance.new("Attachment")
+        attachment.Name = "Att_" .. tostring(index)
+        attachment.Parent = Workspace.Terrain
 
-        attachment.Name =
-            "Att_" .. tostring(index)
-
-        attachment.Parent =
-            Workspace.Terrain
-
-        AttachmentsPool[index] =
-            attachment
+        AttachmentsPool[index] = attachment
     end
 
-    if index > 1
-        and not BeamsPool[index - 1]
-    then
+    if index > 1 and not BeamsPool[index - 1] then
+        local beam = Instance.new("Beam")
 
-        local beam =
-            Instance.new("Beam")
-
-        beam.Name =
-            "Beam_" .. tostring(index - 1)
-
-        beam.Width0 =
-            Config.BeamWidth
-
-        beam.Width1 =
-            Config.BeamWidth
-
-        beam.FaceCamera =
-            true
-
-        beam.Attachment0 =
-            AttachmentsPool[index - 1]
-
-        beam.Attachment1 =
-            AttachmentsPool[index]
-
-        beam.Parent =
-            targetFolder
-
-        BeamsPool[index - 1] =
-            beam
+        beam.Name = "Beam_" .. tostring(index - 1)
+        beam.Parent = targetFolder
+        BeamsPool[index - 1] = beam
     end
 
-    local beam =
-        BeamsPool[index - 1]
+    local beam = BeamsPool[index - 1]
 
     if beam then
+        -- Rebind every frame in case an attachment was recreated.
+        beam.Attachment0 = AttachmentsPool[index - 1]
+        beam.Attachment1 = AttachmentsPool[index]
 
-        beam.Color =
-            ColorSequence.new(
-                Config.CurrentColor
-            )
+        beam.Color = ColorSequence.new(Config.CurrentColor)
+        beam.Width0 = Config.BeamWidth
+        beam.Width1 = Config.BeamWidth
+        beam.FaceCamera = true
+        beam.Enabled = true
 
-        beam.Width0 =
-            Config.BeamWidth
-
-        beam.Width1 =
-            Config.BeamWidth
-
-        beam.Enabled =
-            true
+        if beam.Parent ~= targetFolder then
+            beam.Parent = targetFolder
+        end
     end
 end
 
 -- ==========================================
--- [ CREATE ARROW ]
+-- [ CREATE DIRECTION ARROW ]
 -- ==========================================
 
 local function createArrow()
-
-    local folder =
-        getVisualFolder()
+    local folder = getVisualFolder()
 
     if not ArrowAttachment0 then
-
-        ArrowAttachment0 =
-            Instance.new("Attachment")
-
-        ArrowAttachment0.Name =
-            "DirectionArrow_Start"
-
-        ArrowAttachment0.Parent =
-            Workspace.Terrain
+        ArrowAttachment0 = Instance.new("Attachment")
+        ArrowAttachment0.Name = "DirectionArrow_Start"
+        ArrowAttachment0.Parent = Workspace.Terrain
     end
 
     if not ArrowAttachment1 then
-
-        ArrowAttachment1 =
-            Instance.new("Attachment")
-
-        ArrowAttachment1.Name =
-            "DirectionArrow_End"
-
-        ArrowAttachment1.Parent =
-            Workspace.Terrain
+        ArrowAttachment1 = Instance.new("Attachment")
+        ArrowAttachment1.Name = "DirectionArrow_End"
+        ArrowAttachment1.Parent = Workspace.Terrain
     end
 
     if not ArrowBeam then
+        ArrowBeam = Instance.new("Beam")
 
-        ArrowBeam =
-            Instance.new("Beam")
+        ArrowBeam.Name = "DirectionArrow"
+        ArrowBeam.Attachment0 = ArrowAttachment0
+        ArrowBeam.Attachment1 = ArrowAttachment1
+        ArrowBeam.FaceCamera = true
 
-        ArrowBeam.Name =
-            "DirectionArrow"
+        ArrowBeam.Width0 = Config.ArrowWidth
+        ArrowBeam.Width1 = Config.ArrowWidth * 0.55
 
-        ArrowBeam.Attachment0 =
-            ArrowAttachment0
+        ArrowBeam.Color = ColorSequence.new(Config.CurrentColor)
+        ArrowBeam.Transparency = NumberSequence.new(0)
 
-        ArrowBeam.Attachment1 =
-            ArrowAttachment1
+        ArrowBeam.Parent = folder
+    else
+        ArrowBeam.Attachment0 = ArrowAttachment0
+        ArrowBeam.Attachment1 = ArrowAttachment1
 
-        ArrowBeam.FaceCamera =
-            true
-
-        ArrowBeam.Width0 =
-            Config.ArrowWidth
-
-        ArrowBeam.Width1 =
-            Config.ArrowWidth * 0.55
-
-        ArrowBeam.Color =
-            ColorSequence.new(
-                Config.CurrentColor
-            )
-
-        ArrowBeam.Transparency =
-            NumberSequence.new(0)
-
-        ArrowBeam.Parent =
-            folder
+        if ArrowBeam.Parent ~= folder then
+            ArrowBeam.Parent = folder
+        end
     end
 end
 
@@ -868,9 +773,7 @@ createArrow()
 -- ==========================================
 
 local function renderDirectionArrow(ball)
-
     if not Config.ShowDirectionArrow then
-
         if ArrowBeam then
             ArrowBeam.Enabled = false
         end
@@ -880,30 +783,19 @@ local function renderDirectionArrow(ball)
 
     createArrow()
 
-    local movement =
-        getCurrentHorizontalVelocity()
+    local movement = getCurrentHorizontalVelocity()
 
-    local horizontal =
-        Vector3.new(
-            movement.X,
-            0,
-            movement.Z
-        )
+    local horizontal = Vector3.new(
+        movement.X,
+        0,
+        movement.Z
+    )
 
-    local speed =
-        horizontal.Magnitude
-
-    local holder =
-        currentHolder
-
-    -- ==========================================
-    -- NẾU ĐANG CẦM BÓNG
-    -- ==========================================
+    local speed = horizontal.Magnitude
+    local holder = currentHolder
 
     if holder then
-
-        local direction =
-            getHolderDirection(holder)
+        local direction = getHolderDirection(holder)
 
         if direction.Magnitude > 0 then
             horizontal =
@@ -924,15 +816,11 @@ local function renderDirectionArrow(ball)
     if speed < Config.MinArrowSpeed
         or horizontal.Magnitude < 0.001
     then
-
-        ArrowBeam.Enabled =
-            false
-
+        ArrowBeam.Enabled = false
         return
     end
 
-    local direction =
-        horizontal.Unit
+    local direction = horizontal.Unit
 
     local arrowLength =
         math.clamp(
@@ -941,33 +829,19 @@ local function renderDirectionArrow(ball)
             Config.MaxArrowLength
         )
 
-    local startPosition =
-        ball.Position
+    local startPosition = ball.Position
 
     local endPosition =
         startPosition
-        + direction
-        * arrowLength
+        + direction * arrowLength
 
-    ArrowAttachment0.WorldPosition =
-        startPosition
+    ArrowAttachment0.WorldPosition = startPosition
+    ArrowAttachment1.WorldPosition = endPosition
 
-    ArrowAttachment1.WorldPosition =
-        endPosition
-
-    ArrowBeam.Width0 =
-        Config.ArrowWidth
-
-    ArrowBeam.Width1 =
-        Config.ArrowWidth * 0.55
-
-    ArrowBeam.Color =
-        ColorSequence.new(
-            Config.CurrentColor
-        )
-
-    ArrowBeam.Enabled =
-        true
+    ArrowBeam.Width0 = Config.ArrowWidth
+    ArrowBeam.Width1 = Config.ArrowWidth * 0.55
+    ArrowBeam.Color = ColorSequence.new(Config.CurrentColor)
+    ArrowBeam.Enabled = true
 end
 
 -- ==========================================
@@ -975,9 +849,7 @@ end
 -- ==========================================
 
 local function renderTrajectory(ball)
-
     if not Config.DrawTrajectory then
-
         for _, beam in pairs(BeamsPool) do
             if beam and beam.Parent then
                 beam.Enabled = false
@@ -993,7 +865,6 @@ local function renderTrajectory(ball)
         predictTrajectory(ball)
 
     if #points == 0 then
-
         for _, beam in pairs(BeamsPool) do
             if beam and beam.Parent then
                 beam.Enabled = false
@@ -1006,43 +877,25 @@ local function renderTrajectory(ball)
     local maxPointIndex
 
     if Config.DrawAllBounces then
-
-        maxPointIndex =
-            #points
-
+        maxPointIndex = #points
     elseif firstImpactIndex > 0 then
-
-        maxPointIndex =
-            firstImpactIndex
-
+        maxPointIndex = firstImpactIndex
     else
-
-        maxPointIndex =
-            #points
+        maxPointIndex = #points
     end
 
     local beamIndex = 1
 
     for i = 1, maxPointIndex do
-
-        local point =
-            points[i]
+        local point = points[i]
 
         if point then
+            getOrCreateBeam(beamIndex)
 
-            getOrCreateBeam(
-                beamIndex
-            )
-
-            local attachment =
-                AttachmentsPool[
-                    beamIndex
-                ]
+            local attachment = AttachmentsPool[beamIndex]
 
             if attachment then
-
-                attachment.WorldPosition =
-                    point
+                attachment.WorldPosition = point
             end
 
             beamIndex += 1
@@ -1050,31 +903,17 @@ local function renderTrajectory(ball)
     end
 
     for i = beamIndex, #AttachmentsPool do
+        local attachment = AttachmentsPool[i]
 
-        local attachment =
-            AttachmentsPool[i]
-
-        if attachment
-            and attachment.Parent
-        then
-
+        if attachment and attachment.Parent then
             attachment.WorldPosition =
-                Vector3.new(
-                    0,
-                    -10000,
-                    0
-                )
+                Vector3.new(0, -10000, 0)
         end
 
-        local beam =
-            BeamsPool[i - 1]
+        local beam = BeamsPool[i - 1]
 
-        if beam
-            and beam.Parent
-        then
-
-            beam.Enabled =
-                false
+        if beam and beam.Parent then
+            beam.Enabled = false
         end
     end
 end
@@ -1084,100 +923,92 @@ end
 -- ==========================================
 
 local function renderLoop()
-
     if isInLobby then
-
         clearAndHideAll()
         return
     end
 
     if not Config.MasterEnabled then
-
         clearAndHideAll()
         return
     end
 
-    local ball =
-        getActiveBall()
+    local ball = getActiveBall()
+    local holder, heldBall = findBallHolder()
 
-    local holder =
-        nil
-
-    -- ==========================================
-    -- FIND HOLDER
-    -- ==========================================
-
-    local holderPlayer, heldBall =
-        findBallHolder()
-
-    if holderPlayer
-        and heldBall
-    then
-        holder =
-            holderPlayer
-    end
-
-    currentHolder =
-        holder
-
-    -- ==========================================
-    -- BALL KHÔNG TỒN TẠI
-    -- ==========================================
+    currentHolder = holder
 
     if not ball then
-
         if heldBall then
-
-            ball =
-                heldBall
-
-            cachedBall =
-                ball
+            ball = heldBall
+            cachedBall = ball
         else
-
             clearAndHideAll()
             return
         end
     end
 
-    -- ==========================================
-    -- HOLDER CHANGE
-    -- ==========================================
-
-    if previousHolder
-        and holder == nil
-    then
-
-        -- BÓNG VỪA RỜI NGƯỜI
-        estimatedVelocity =
-            smoothedHorizontalVelocity
+    -- Detect release transition.
+    if previousHolder and not holder then
+        estimatedVelocity = smoothedHorizontalVelocity
     end
 
-    -- ==========================================
-    -- UPDATE MOVEMENT
-    -- ==========================================
+    updateMovementEstimate(ball, holder)
 
-    updateMovementEstimate(
-        ball,
-        holder
-    )
-
-    -- ==========================================
-    -- ARROW
-    -- ==========================================
-
-    renderDirectionArrow(
-        ball
-    )
-
-    -- ==========================================
-    -- TRAJECTORY
-    -- ==========================================
-
-    renderTrajectory(
-        ball
-    )
+    renderDirectionArrow(ball)
+    renderTrajectory(ball)
 end
+
+-- ==========================================
+-- [ PLAYER EVENTS ]
+-- ==========================================
+
+local playerConnections = {}
+
+local function trackCharacter(player)
+    if not player then
+        return
+    end
+
+    local oldConnection = playerConnections[player]
+
+    if oldConnection then
+        oldConnection:Disconnect()
+        playerConnections[player] = nil
+    end
+
+    playerConnections[player] =
+        player.CharacterAdded:Connect(function()
+            markRaycastFilterDirty()
+            cachedHolder = nil
+            cachedHeldBall = nil
+            lastHolderCheck = 0
+        end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    trackCharacter(player)
+end
+
+Players.PlayerAdded:Connect(function(player)
+    markRaycastFilterDirty()
+    trackCharacter(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    markRaycastFilterDirty()
+
+    cachedHolder = nil
+    cachedHeldBall = nil
+    lastHolderCheck = 0
+
+    local connection = playerConnections[player]
+
+    if connection then
+        connection:Disconnect()
+        playerConnections[player] = nil
+    end
+end)
 
 -- ==========================================
 -- [ TEAM CHANGE ]
@@ -1186,172 +1017,81 @@ end
 _G.BallTrackerTeamConnection =
     LocalPlayer:GetPropertyChangedSignal("Team")
         :Connect(function()
-
-            isInLobby =
-                isLobbyTeam()
+            isInLobby = isLobbyTeam()
 
             clearAndHideAll()
+
+            markRaycastFilterDirty()
         end)
 
 -- ==========================================
 -- [ INITIAL STATE ]
 -- ==========================================
 
-isInLobby =
-    isLobbyTeam()
+isInLobby = isLobbyTeam()
 
 if isInLobby then
     clearAndHideAll()
 end
 
 -- ==========================================
--- [ START ]
--- ==========================================
-
-_G.BallTrackerConnection =
-    RunService.RenderStepped:Connect(
-        renderLoop
-    )
-
--- ==========================================
 -- [ GUI ]
 -- ==========================================
 
-local ScreenGui =
-    Instance.new("ScreenGui")
+local ScreenGui = Instance.new("ScreenGui")
 
-ScreenGui.Name =
-    "BallTrackerUI"
-
-ScreenGui.ResetOnSpawn =
-    false
-
-ScreenGui.Parent =
-    GuiParent
+ScreenGui.Name = "BallTrackerUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = GuiParent
 
 -- ==========================================
 -- [ MENU BUTTON ]
 -- ==========================================
 
-local ToggleMenuBtn =
-    Instance.new("TextButton")
+local ToggleMenuBtn = Instance.new("TextButton")
 
-ToggleMenuBtn.Parent =
-    ScreenGui
-
-ToggleMenuBtn.Size =
-    UDim2.new(
-        0,
-        120,
-        0,
-        35
-    )
-
-ToggleMenuBtn.Position =
-    UDim2.new(
-        0.01,
-        0,
-        0.18,
-        0
-    )
+ToggleMenuBtn.Parent = ScreenGui
+ToggleMenuBtn.Size = UDim2.new(0, 120, 0, 35)
+ToggleMenuBtn.Position = UDim2.new(0.01, 0, 0.18, 0)
 
 ToggleMenuBtn.BackgroundColor3 =
-    Color3.fromRGB(
-        25,
-        25,
-        30
-    )
+    Color3.fromRGB(25, 25, 30)
 
-ToggleMenuBtn.Text =
-    "⚡ Tracker Menu"
-
+ToggleMenuBtn.Text = "⚡ Tracker Menu"
 ToggleMenuBtn.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
+    Color3.fromRGB(255, 255, 255)
 
-ToggleMenuBtn.Font =
-    Enum.Font.GothamBold
+ToggleMenuBtn.Font = Enum.Font.GothamBold
+ToggleMenuBtn.TextSize = 12
 
-ToggleMenuBtn.TextSize =
-    12
+local ToggleCorner = Instance.new("UICorner")
+ToggleCorner.CornerRadius = UDim.new(0, 8)
+ToggleCorner.Parent = ToggleMenuBtn
 
-local ToggleCorner =
-    Instance.new("UICorner")
-
-ToggleCorner.CornerRadius =
-    UDim.new(
-        0,
-        8
-    )
-
-ToggleCorner.Parent =
-    ToggleMenuBtn
-
-local ToggleStroke =
-    Instance.new("UIStroke")
-
-ToggleStroke.Color =
-    Config.CurrentColor
-
-ToggleStroke.Thickness =
-    1.5
-
-ToggleStroke.Parent =
-    ToggleMenuBtn
+local ToggleStroke = Instance.new("UIStroke")
+ToggleStroke.Color = Config.CurrentColor
+ToggleStroke.Thickness = 1.5
+ToggleStroke.Parent = ToggleMenuBtn
 
 -- ==========================================
 -- [ MAIN FRAME ]
 -- ==========================================
 
-local MainFrame =
-    Instance.new("Frame")
+local MainFrame = Instance.new("Frame")
 
-MainFrame.Parent =
-    ScreenGui
-
-MainFrame.Size =
-    UDim2.new(
-        0,
-        310,
-        0,
-        360
-    )
-
-MainFrame.Position =
-    UDim2.new(
-        0.08,
-        0,
-        0.18,
-        0
-    )
+MainFrame.Parent = ScreenGui
+MainFrame.Size = UDim2.new(0, 310, 0, 360)
+MainFrame.Position = UDim2.new(0.08, 0, 0.18, 0)
 
 MainFrame.BackgroundColor3 =
-    Color3.fromRGB(
-        20,
-        20,
-        25
-    )
+    Color3.fromRGB(20, 20, 25)
 
-MainFrame.BorderSizePixel =
-    0
+MainFrame.BorderSizePixel = 0
+MainFrame.Visible = false
 
-MainFrame.Visible =
-    false
-
-local MainCorner =
-    Instance.new("UICorner")
-
-MainCorner.CornerRadius =
-    UDim.new(
-        0,
-        10
-    )
-
-MainCorner.Parent =
-    MainFrame
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 10)
+MainCorner.Parent = MainFrame
 
 -- ==========================================
 -- [ DRAG ]
@@ -1361,241 +1101,120 @@ local dragging = false
 local dragStart = nil
 local startPos = nil
 
-MainFrame.InputBegan:Connect(
-    function(input)
-
-        if input.UserInputType
-            == Enum.UserInputType.MouseButton1
-            or input.UserInputType
-            == Enum.UserInputType.Touch
-        then
-
-            dragging =
-                true
-
-            dragStart =
-                input.Position
-
-            startPos =
-                MainFrame.Position
-        end
+MainFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
     end
-)
+end)
 
-MainFrame.InputEnded:Connect(
-    function(input)
-
-        if input.UserInputType
-            == Enum.UserInputType.MouseButton1
-            or input.UserInputType
-            == Enum.UserInputType.Touch
-        then
-
-            dragging =
-                false
-        end
+-- Global release handler fixes the "stuck dragging" issue.
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        dragging = false
     end
-)
+end)
 
-UserInputService.InputChanged:Connect(
-    function(input)
-
-        if not dragging then
-            return
-        end
-
-        if input.UserInputType
-            ~= Enum.UserInputType.MouseMovement
-            and input.UserInputType
-            ~= Enum.UserInputType.Touch
-        then
-
-            return
-        end
-
-        local delta =
-            input.Position
-            - dragStart
-
-        MainFrame.Position =
-            UDim2.new(
-                startPos.X.Scale,
-                startPos.X.Offset
-                    + delta.X,
-
-                startPos.Y.Scale,
-                startPos.Y.Offset
-                    + delta.Y
-            )
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then
+        return
     end
-)
 
-ToggleMenuBtn.MouseButton1Click:Connect(
-    function()
-
-        MainFrame.Visible =
-            not MainFrame.Visible
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch
+    then
+        return
     end
-)
+
+    local delta = input.Position - dragStart
+
+    MainFrame.Position =
+        UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+end)
+
+ToggleMenuBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+end)
 
 -- ==========================================
 -- [ TITLE ]
 -- ==========================================
 
-local Title =
-    Instance.new("TextLabel")
+local Title = Instance.new("TextLabel")
 
-Title.Parent =
-    MainFrame
+Title.Parent = MainFrame
+Title.Size = UDim2.new(1, 0, 0, 38)
+Title.BackgroundTransparency = 1
 
-Title.Size =
-    UDim2.new(
-        1,
-        0,
-        0,
-        38
-    )
-
-Title.BackgroundTransparency =
-    1
-
-Title.Text =
-    "⚽ Ball Trajectory Manager"
+Title.Text = "⚽ Ball Trajectory Manager"
 
 Title.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
+    Color3.fromRGB(255, 255, 255)
 
-Title.Font =
-    Enum.Font.GothamBold
-
-Title.TextSize =
-    13
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 13
 
 -- ==========================================
 -- [ LAYOUT ]
 -- ==========================================
 
-local Layout =
-    Instance.new("UIListLayout")
+local Layout = Instance.new("UIListLayout")
 
-Layout.Parent =
-    MainFrame
-
-Layout.SortOrder =
-    Enum.SortOrder.LayoutOrder
-
-Layout.Padding =
-    UDim.new(
-        0,
-        7
-    )
-
-Layout.HorizontalAlignment =
-    Enum.HorizontalAlignment.Center
+Layout.Parent = MainFrame
+Layout.SortOrder = Enum.SortOrder.LayoutOrder
+Layout.Padding = UDim.new(0, 7)
+Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 
 -- ==========================================
 -- [ GENERIC TOGGLE ]
 -- ==========================================
 
-local function createToggle(
-    text,
-    defaultState,
-    callback
-)
+local function createToggle(text, defaultState, callback)
+    local button = Instance.new("TextButton")
 
-    local button =
-        Instance.new("TextButton")
+    button.Parent = MainFrame
+    button.Size = UDim2.new(0.92, 0, 0, 34)
 
-    button.Parent =
-        MainFrame
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 11
+    button.TextColor3 = Color3.fromRGB(255, 255, 255)
 
-    button.Size =
-        UDim2.new(
-            0.92,
-            0,
-            0,
-            34
-        )
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = button
 
-    button.Font =
-        Enum.Font.GothamBold
-
-    button.TextSize =
-        11
-
-    button.TextColor3 =
-        Color3.fromRGB(
-            255,
-            255,
-            255
-        )
-
-    local corner =
-        Instance.new("UICorner")
-
-    corner.CornerRadius =
-        UDim.new(
-            0,
-            6
-        )
-
-    corner.Parent =
-        button
-
-    local state =
-        defaultState
+    local state = defaultState
 
     local function updateVisual()
-
         if state then
-
             button.BackgroundColor3 =
-                Color3.fromRGB(
-                    40,
-                    140,
-                    60
-                )
+                Color3.fromRGB(40, 140, 60)
 
-            button.Text =
-                text
-                .. ": BẬT 🟢"
-
+            button.Text = text .. ": BẬT 🟢"
         else
-
             button.BackgroundColor3 =
-                Color3.fromRGB(
-                    160,
-                    45,
-                    45
-                )
+                Color3.fromRGB(160, 45, 45)
 
-            button.Text =
-                text
-                .. ": TẮT 🔴"
+            button.Text = text .. ": TẮT 🔴"
         end
     end
 
-    button.MouseButton1Click:Connect(
-        function()
+    button.MouseButton1Click:Connect(function()
+        state = not state
 
-            state =
-                not state
-
-            updateVisual()
-
-            callback(
-                state
-            )
-
-            if not state then
-                clearAndHideAll()
-            end
-        end
-    )
+        updateVisual()
+        callback(state)
+    end)
 
     updateVisual()
 
@@ -1603,16 +1222,14 @@ local function createToggle(
 end
 
 -- ==========================================
--- [ MASTER ]
+-- [ MASTER TOGGLE ]
 -- ==========================================
 
 createToggle(
     "Công Tắc Tracker Tổng",
     Config.MasterEnabled,
     function(state)
-
-        Config.MasterEnabled =
-            state
+        Config.MasterEnabled = state
 
         if not state then
             clearAndHideAll()
@@ -1628,16 +1245,10 @@ createToggle(
     "Mũi Tên Hướng",
     Config.ShowDirectionArrow,
     function(state)
+        Config.ShowDirectionArrow = state
 
-        Config.ShowDirectionArrow =
-            state
-
-        if not state
-            and ArrowBeam
-        then
-
-            ArrowBeam.Enabled =
-                false
+        if not state and ArrowBeam then
+            ArrowBeam.Enabled = false
         end
     end
 )
@@ -1650,9 +1261,7 @@ createToggle(
     "Quỹ Đạo",
     Config.DrawTrajectory,
     function(state)
-
-        Config.DrawTrajectory =
-            state
+        Config.DrawTrajectory = state
     end
 )
 
@@ -1660,61 +1269,28 @@ createToggle(
 -- [ BOUNCE MODE ]
 -- ==========================================
 
-local bounceModeBtn =
-    Instance.new("TextButton")
+local bounceModeBtn = Instance.new("TextButton")
 
-bounceModeBtn.Parent =
-    MainFrame
-
-bounceModeBtn.Size =
-    UDim2.new(
-        0.92,
-        0,
-        0,
-        32
-    )
+bounceModeBtn.Parent = MainFrame
+bounceModeBtn.Size = UDim2.new(0.92, 0, 0, 32)
 
 bounceModeBtn.BackgroundColor3 =
-    Color3.fromRGB(
-        40,
-        40,
-        50
-    )
+    Color3.fromRGB(40, 40, 50)
 
-bounceModeBtn.Font =
-    Enum.Font.GothamBold
-
-bounceModeBtn.TextSize =
-    11
-
+bounceModeBtn.Font = Enum.Font.GothamBold
+bounceModeBtn.TextSize = 11
 bounceModeBtn.TextColor3 =
-    Color3.fromRGB(
-        220,
-        220,
-        220
-    )
+    Color3.fromRGB(220, 220, 220)
 
-local BounceCorner =
-    Instance.new("UICorner")
-
-BounceCorner.CornerRadius =
-    UDim.new(
-        0,
-        6
-    )
-
-BounceCorner.Parent =
-    bounceModeBtn
+local BounceCorner = Instance.new("UICorner")
+BounceCorner.CornerRadius = UDim.new(0, 6)
+BounceCorner.Parent = bounceModeBtn
 
 local function updateBounceText()
-
     if Config.DrawAllBounces then
-
         bounceModeBtn.Text =
             "Quỹ Đạo: VẼ TẤT CẢ CÁC ĐIỂM 🌐"
-
     else
-
         bounceModeBtn.Text =
             "Quỹ Đạo: CHỈ ĐIỂM RƠI ĐẦU 🎯"
     end
@@ -1722,338 +1298,181 @@ end
 
 updateBounceText()
 
-bounceModeBtn.MouseButton1Click:Connect(
-    function()
+bounceModeBtn.MouseButton1Click:Connect(function()
+    Config.DrawAllBounces = not Config.DrawAllBounces
 
-        Config.DrawAllBounces =
-            not Config.DrawAllBounces
+    updateBounceText()
 
-        updateBounceText()
-
-        clearAndHideAll()
-    end
-)
+    clearAndHideAll()
+end)
 
 -- ==========================================
 -- [ CLEAR ]
 -- ==========================================
 
-local ClearTrackerBtn =
-    Instance.new("TextButton")
+local ClearTrackerBtn = Instance.new("TextButton")
 
-ClearTrackerBtn.Parent =
-    MainFrame
-
-ClearTrackerBtn.Size =
-    UDim2.new(
-        0.92,
-        0,
-        0,
-        34
-    )
+ClearTrackerBtn.Parent = MainFrame
+ClearTrackerBtn.Size = UDim2.new(0.92, 0, 0, 34)
 
 ClearTrackerBtn.BackgroundColor3 =
-    Color3.fromRGB(
-        120,
-        70,
-        40
-    )
+    Color3.fromRGB(120, 70, 40)
 
-ClearTrackerBtn.Font =
-    Enum.Font.GothamBold
-
-ClearTrackerBtn.TextSize =
-    11
-
+ClearTrackerBtn.Font = Enum.Font.GothamBold
+ClearTrackerBtn.TextSize = 11
 ClearTrackerBtn.TextColor3 =
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
+    Color3.fromRGB(255, 255, 255)
 
 ClearTrackerBtn.Text =
     "🧹 HỦY TẤT CẢ TRACKER TẠM THỜI"
 
-local ClearTrackerCorner =
-    Instance.new("UICorner")
+local ClearTrackerCorner = Instance.new("UICorner")
+ClearTrackerCorner.CornerRadius = UDim.new(0, 6)
+ClearTrackerCorner.Parent = ClearTrackerBtn
 
-ClearTrackerCorner.CornerRadius =
-    UDim.new(
-        0,
-        6
-    )
-
-ClearTrackerCorner.Parent =
-    ClearTrackerBtn
-
-ClearTrackerBtn.MouseButton1Click:Connect(
-    function()
-
-        clearAndHideAll()
-    end
-)
+ClearTrackerBtn.MouseButton1Click:Connect(function()
+    clearAndHideAll()
+end)
 
 -- ==========================================
 -- [ ARROW INFO ]
 -- ==========================================
 
-local ArrowInfo =
-    Instance.new("TextLabel")
+local ArrowInfo = Instance.new("TextLabel")
 
-ArrowInfo.Parent =
-    MainFrame
-
-ArrowInfo.Size =
-    UDim2.new(
-        0.92,
-        0,
-        0,
-        42
-    )
-
-ArrowInfo.BackgroundTransparency =
-    1
+ArrowInfo.Parent = MainFrame
+ArrowInfo.Size = UDim2.new(0.92, 0, 0, 42)
+ArrowInfo.BackgroundTransparency = 1
 
 ArrowInfo.Text =
     "Mũi tên = hướng X/Z\n"
     .. "Độ dài = tốc độ ước lượng"
 
 ArrowInfo.TextColor3 =
-    Color3.fromRGB(
-        170,
-        170,
-        180
-    )
+    Color3.fromRGB(170, 170, 180)
 
-ArrowInfo.Font =
-    Enum.Font.Gotham
-
-ArrowInfo.TextSize =
-    10
-
-ArrowInfo.TextXAlignment =
-    Enum.TextXAlignment.Left
-
-ArrowInfo.TextYAlignment =
-    Enum.TextYAlignment.Top
+ArrowInfo.Font = Enum.Font.Gotham
+ArrowInfo.TextSize = 10
+ArrowInfo.TextXAlignment = Enum.TextXAlignment.Left
+ArrowInfo.TextYAlignment = Enum.TextYAlignment.Top
 
 -- ==========================================
 -- [ COLOR LABEL ]
 -- ==========================================
 
-local PaletteLabel =
-    Instance.new("TextLabel")
+local PaletteLabel = Instance.new("TextLabel")
 
-PaletteLabel.Parent =
-    MainFrame
+PaletteLabel.Parent = MainFrame
+PaletteLabel.Size = UDim2.new(0.92, 0, 0, 18)
+PaletteLabel.BackgroundTransparency = 1
 
-PaletteLabel.Size =
-    UDim2.new(
-        0.92,
-        0,
-        0,
-        18
-    )
-
-PaletteLabel.BackgroundTransparency =
-    1
-
-PaletteLabel.Text =
-    "🎨 Chọn Màu Giao Diện:"
+PaletteLabel.Text = "🎨 Chọn Màu Giao Diện:"
 
 PaletteLabel.TextColor3 =
-    Color3.fromRGB(
-        180,
-        180,
-        180
-    )
+    Color3.fromRGB(180, 180, 180)
 
-PaletteLabel.Font =
-    Enum.Font.GothamBold
-
-PaletteLabel.TextSize =
-    11
-
-PaletteLabel.TextXAlignment =
-    Enum.TextXAlignment.Left
+PaletteLabel.Font = Enum.Font.GothamBold
+PaletteLabel.TextSize = 11
+PaletteLabel.TextXAlignment = Enum.TextXAlignment.Left
 
 -- ==========================================
 -- [ PALETTE ]
 -- ==========================================
 
-local PaletteFrame =
-    Instance.new("Frame")
+local PaletteFrame = Instance.new("Frame")
 
-PaletteFrame.Parent =
-    MainFrame
+PaletteFrame.Parent = MainFrame
+PaletteFrame.Size = UDim2.new(0.92, 0, 0, 32)
+PaletteFrame.BackgroundTransparency = 1
 
-PaletteFrame.Size =
-    UDim2.new(
-        0.92,
-        0,
-        0,
-        32
-    )
+local PaletteLayout = Instance.new("UIGridLayout")
 
-PaletteFrame.BackgroundTransparency =
-    1
-
-local PaletteLayout =
-    Instance.new("UIGridLayout")
-
-PaletteLayout.Parent =
-    PaletteFrame
-
-PaletteLayout.CellSize =
-    UDim2.new(
-        0,
-        38,
-        0,
-        30
-    )
-
-PaletteLayout.CellPadding =
-    UDim2.new(
-        0,
-        7,
-        0,
-        0
-    )
+PaletteLayout.Parent = PaletteFrame
+PaletteLayout.CellSize = UDim2.new(0, 38, 0, 30)
+PaletteLayout.CellPadding = UDim2.new(0, 7, 0, 0)
 
 local ColorsList = {
-    Color3.fromRGB(
-        0,
-        255,
-        238
-    ),
-
-    Color3.fromRGB(
-        255,
-        238,
-        0
-    ),
-
-    Color3.fromRGB(
-        0,
-        255,
-        100
-    ),
-
-    Color3.fromRGB(
-        255,
-        50,
-        80
-    ),
-
-    Color3.fromRGB(
-        200,
-        70,
-        255
-    ),
-
-    Color3.fromRGB(
-        255,
-        255,
-        255
-    )
+    Color3.fromRGB(0, 255, 238),
+    Color3.fromRGB(255, 238, 0),
+    Color3.fromRGB(0, 255, 100),
+    Color3.fromRGB(255, 50, 80),
+    Color3.fromRGB(200, 70, 255),
+    Color3.fromRGB(255, 255, 255)
 }
 
-for _, color in ipairs(
-    ColorsList
-) do
+for _, color in ipairs(ColorsList) do
+    local colorButton = Instance.new("TextButton")
 
-    local colorButton =
-        Instance.new("TextButton")
-
-    colorButton.Parent =
-        PaletteFrame
-
-    colorButton.BackgroundColor3 =
-        color
-
+    colorButton.Parent = PaletteFrame
+    colorButton.BackgroundColor3 = color
     colorButton.Text = ""
 
-    local colorCorner =
-        Instance.new("UICorner")
+    local colorCorner = Instance.new("UICorner")
+    colorCorner.CornerRadius = UDim.new(0, 5)
+    colorCorner.Parent = colorButton
 
-    colorCorner.CornerRadius =
-        UDim.new(
-            0,
-            5
-        )
+    colorButton.MouseButton1Click:Connect(function()
+        Config.CurrentColor = color
 
-    colorCorner.Parent =
-        colorButton
+        ToggleStroke.Color = color
 
-    colorButton.MouseButton1Click:Connect(
-        function()
+        if ArrowBeam then
+            ArrowBeam.Color =
+                ColorSequence.new(color)
+        end
 
-            Config.CurrentColor =
-                color
-
-            ToggleStroke.Color =
-                color
-
-            if ArrowBeam then
-                ArrowBeam.Color =
-                    ColorSequence.new(
-                        color
-                    )
-            end
-
-            for _, beam in pairs(
-                BeamsPool
-            ) do
-
-                if beam
-                    and beam.Parent
-                then
-
-                    beam.Color =
-                        ColorSequence.new(
-                            color
-                        )
-                end
+        for _, beam in pairs(BeamsPool) do
+            if beam and beam.Parent then
+                beam.Color =
+                    ColorSequence.new(color)
             end
         end
-    )
+    end)
 end
+
+-- ==========================================
+-- [ INITIAL FILTER STATE ]
+-- ==========================================
+
+markRaycastFilterDirty()
+
+-- ==========================================
+-- [ MAIN CONNECTION ]
+-- ==========================================
+
+_G.BallTrackerConnection =
+    RunService.RenderStepped:Connect(renderLoop)
 
 -- ==========================================
 -- [ CLEANUP ]
 -- ==========================================
 
-ScreenGui.Destroying:Connect(
-    function()
+ScreenGui.Destroying:Connect(function()
+    if _G.BallTrackerConnection then
+        pcall(function()
+            _G.BallTrackerConnection:Disconnect()
+        end)
 
-        if _G.BallTrackerConnection then
-
-            pcall(
-                function()
-                    _G.BallTrackerConnection:Disconnect()
-                end
-            )
-
-            _G.BallTrackerConnection =
-                nil
-        end
-
-        if _G.BallTrackerTeamConnection then
-
-            pcall(
-                function()
-                    _G.BallTrackerTeamConnection:Disconnect()
-                end
-            )
-
-            _G.BallTrackerTeamConnection =
-                nil
-        end
-
-        if ArrowBeam then
-            ArrowBeam.Enabled =
-                false
-        end
+        _G.BallTrackerConnection = nil
     end
-)
+
+    if _G.BallTrackerTeamConnection then
+        pcall(function()
+            _G.BallTrackerTeamConnection:Disconnect()
+        end)
+
+        _G.BallTrackerTeamConnection = nil
+    end
+
+    for player, connection in pairs(playerConnections) do
+        if connection then
+            connection:Disconnect()
+        end
+
+        playerConnections[player] = nil
+    end
+
+    if ArrowBeam then
+        ArrowBeam.Enabled = false
+    end
+end)
