@@ -1,11 +1,12 @@
---//========================================================--
---//                 BALL CONTROLLER
---//              LOCK SYSTEM FIXED VERSION
---//========================================================--
+--========================================================--
+--                 BALL CONTROLLER V3                     --
+--  Modes 1-4 / Steal Ball / Sae Pass / Settings Panel   --
+--========================================================--
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -15,2036 +16,1262 @@ local playerGui = player:WaitForChild("PlayerGui")
 --========================================================--
 
 local BALL_NAME = "Ball"
-
-local DEFAULT_SPEED = 60
-local DEFAULT_HOTKEY = Enum.KeyCode.F
-
 local MIN_SPEED = 1
 local MAX_SPEED = 1000
+local DEFAULT_CONTROL_KEY = Enum.KeyCode.F
+local DEFAULT_STEAL_DISTANCE = 3
+local SAE_PASS_HEIGHT = 300
+local SAE_PASS_SPEED = 260
 
---========================================================--
--- STATE
---========================================================--
-
-local enabled = false
 local mode = 1
-
-local speed = DEFAULT_SPEED
-local hotkey = DEFAULT_HOTKEY
-
-local autoLock = true
-local manualLock = false
-
-local changingHotkey = false
+local controlKey = DEFAULT_CONTROL_KEY
+local enabled = false
+local anchorEnabled = true
+local stealBallEnabled = false
+local saePassEnabled = false
+local changingControlKey = false
+local leftMouseHeld = false
 local minimized = false
+local settingsOpen = false
+local selectedTarget = nil
+local saePassActive = false
+local lastHolder = nil
+local lastOwnershipState = nil
+local lastControlPress = 0
+local stealCooldown = 0
 
-local keys = {
-	W = false,
-	A = false,
-	S = false,
-	D = false,
-	Q = false,
-	E = false
+local modeSettings = {
+    [1] = { speed = 60 },
+    [2] = { speed = 60 },
+    [3] = { speed = 60, height = 80, curve = 30 },
+    [4] = { speed = 140 },
 }
+
+local keys = {W=false,A=false,S=false,D=false,Q=false,E=false}
 
 --========================================================--
 -- CHARACTER
 --========================================================--
 
-local character = nil
-local humanoid = nil
-local rootPart = nil
-
--- Trạng thái trước khi SCRIPT lock
-local savedWalkSpeed = nil
-local savedJumpPower = nil
-local savedAutoRotate = nil
-
-local playerIsLocked = false
-
---========================================================--
--- UPDATE CHARACTER
---========================================================--
+local character, humanoid, rootPart
+local savedWalkSpeed, savedJumpPower, savedAutoRotate
+local playerWasLocked = false
 
 local function updateCharacter()
+    character = player.Character
+    if not character then
+        humanoid, rootPart = nil, nil
+        return false
+    end
 
-	character = player.Character
-
-	if not character then
-
-		humanoid = nil
-		rootPart = nil
-
-		return false
-	end
-
-	humanoid =
-		character:FindFirstChildOfClass(
-			"Humanoid"
-		)
-
-	rootPart =
-		character:FindFirstChild(
-			"HumanoidRootPart"
-		)
-
-	return humanoid ~= nil
-		and rootPart ~= nil
+    humanoid = character:FindFirstChildOfClass("Humanoid")
+    rootPart = character:FindFirstChild("HumanoidRootPart")
+    return humanoid ~= nil and rootPart ~= nil
 end
 
 updateCharacter()
 
---========================================================--
--- SAVE ORIGINAL HUMANOID STATE
---========================================================--
-
 local function savePlayerState()
+    if not humanoid then return end
 
-	if not humanoid then
-		return
-	end
+    -- Không ghi đè state hợp lệ bằng WalkSpeed = 0 do chính lock vừa áp dụng.
+    if savedWalkSpeed == nil and humanoid.WalkSpeed > 0 then
+        savedWalkSpeed = humanoid.WalkSpeed
+    end
 
-	-- Chỉ lưu một lần mỗi lần lock
-	if savedWalkSpeed == nil then
+    if savedJumpPower == nil then
+        savedJumpPower = humanoid.JumpPower
+    end
 
-		savedWalkSpeed =
-			humanoid.WalkSpeed
-	end
-
-	if savedJumpPower == nil then
-
-		savedJumpPower =
-			humanoid.JumpPower
-	end
-
-	if savedAutoRotate == nil then
-
-		savedAutoRotate =
-			humanoid.AutoRotate
-	end
+    if savedAutoRotate == nil then
+        savedAutoRotate = humanoid.AutoRotate
+    end
 end
-
---========================================================--
--- LOCK PLAYER
---========================================================--
 
 local function lockPlayer()
-
-	if not updateCharacter() then
-		return
-	end
-
-	-- Lưu state thật trước khi thay đổi
-	savePlayerState()
-
-	--====================================================--
-	-- KHÔNG CÒN:
-	-- rootPart.Anchored = true
-	--
-	-- Vì Anchor là nguyên nhân gây lỗi lock vị trí.
-	--====================================================--
-
-	humanoid.WalkSpeed = 0
-	humanoid.JumpPower = 0
-	humanoid.AutoRotate = false
-
-	playerIsLocked = true
+    if not updateCharacter() then return end
+    savePlayerState()
+    humanoid.WalkSpeed = 0
+    humanoid.JumpPower = 0
+    humanoid.AutoRotate = false
+    playerWasLocked = true
 end
-
---========================================================--
--- UNLOCK PLAYER
---========================================================--
 
 local function unlockPlayer()
+    if not updateCharacter() then
+        playerWasLocked = false
+        savedWalkSpeed, savedJumpPower, savedAutoRotate = nil, nil, nil
+        return
+    end
 
-	if not updateCharacter() then
+    if playerWasLocked then
+        if savedWalkSpeed ~= nil then humanoid.WalkSpeed = savedWalkSpeed end
+        if savedJumpPower ~= nil then humanoid.JumpPower = savedJumpPower end
+        if savedAutoRotate ~= nil then humanoid.AutoRotate = savedAutoRotate end
+    end
 
-		playerIsLocked = false
+    playerWasLocked = false
+    savedWalkSpeed, savedJumpPower, savedAutoRotate = nil, nil, nil
+end
 
-		savedWalkSpeed = nil
-		savedJumpPower = nil
-		savedAutoRotate = nil
+-- Chỉ Mode 1/2 dùng Anchor. Nút Force Unanchor luôn thắng.
+local function applyModeLock()
+    if not updateCharacter() then return end
 
-		return
-	end
+    if enabled and anchorEnabled and (mode == 1 or mode == 2) then
+        savePlayerState()
+        humanoid.WalkSpeed = 0
+        humanoid.JumpPower = 0
+        humanoid.AutoRotate = false
+        rootPart.Anchored = true
+        playerWasLocked = true
+    else
+        if rootPart and rootPart.Anchored then
+            rootPart.Anchored = false
+        end
+        unlockPlayer()
+    end
+end
 
-	-- Chỉ restore khi SCRIPT đã từng lock
-	if playerIsLocked then
-
-		if savedWalkSpeed ~= nil then
-
-			humanoid.WalkSpeed =
-				savedWalkSpeed
-
-		end
-
-		if savedJumpPower ~= nil then
-
-			humanoid.JumpPower =
-				savedJumpPower
-
-		end
-
-		if savedAutoRotate ~= nil then
-
-			humanoid.AutoRotate =
-				savedAutoRotate
-
-		end
-
-	end
-
-	playerIsLocked = false
-
-	savedWalkSpeed = nil
-	savedJumpPower = nil
-	savedAutoRotate = nil
+local function forceUnanchor()
+    updateCharacter()
+    if rootPart then rootPart.Anchored = false end
+    unlockPlayer()
+    notify("ANCHOR", "Force Unanchor executed", 1.6)
 end
 
 --========================================================--
--- FORCE UNLOCK
+-- BALL / HOLDER HELPERS
 --========================================================--
 
-local function forceUnlock()
-
-	if not updateCharacter() then
-
-		playerIsLocked = false
-
-		savedWalkSpeed = nil
-		savedJumpPower = nil
-		savedAutoRotate = nil
-
-		return
-	end
-
-	-- Nếu script đang lock thì restore state gốc
-	if playerIsLocked then
-
-		if savedWalkSpeed ~= nil then
-
-			humanoid.WalkSpeed =
-				savedWalkSpeed
-
-		end
-
-		if savedJumpPower ~= nil then
-
-			humanoid.JumpPower =
-				savedJumpPower
-
-		end
-
-		if savedAutoRotate ~= nil then
-
-			humanoid.AutoRotate =
-				savedAutoRotate
-
-		end
-
-	else
-
-		-- Script không lock thì KHÔNG tự ý
-		-- reset WalkSpeed/JumpPower của game.
-		-- Chỉ chắc chắn AutoRotate không bị script này giữ.
-	end
-
-	playerIsLocked = false
-
-	savedWalkSpeed = nil
-	savedJumpPower = nil
-	savedAutoRotate = nil
+local function isMatchPlayer(plr)
+    if not plr or not plr.Team then return false end
+    local n = string.lower(plr.Team.Name)
+    return string.find(n, "home", 1, true) ~= nil or string.find(n, "away", 1, true) ~= nil
 end
-
---========================================================--
--- UPDATE LOCK
---========================================================--
-
-local function updateLock()
-
-	-- Auto Lock chỉ có tác dụng khi Control ON.
-	local shouldLock =
-		(enabled and autoLock)
-		or manualLock
-
-	if shouldLock then
-
-		lockPlayer()
-
-	else
-
-		unlockPlayer()
-
-	end
-end
-
---========================================================--
--- FIND BALL
---========================================================--
 
 local function findBall()
+    if character then
+        local ball = character:FindFirstChild(BALL_NAME, true)
+        if ball and ball:IsA("BasePart") then return ball end
+    end
 
-	-- Ball bên trong character
-	if character then
+    local playerModel = workspace:FindFirstChild(player.Name)
+    if playerModel then
+        local ball = playerModel:FindFirstChild(BALL_NAME, true)
+        if ball and ball:IsA("BasePart") then return ball end
+    end
 
-		local ball =
-			character:FindFirstChild(
-				BALL_NAME,
-				true
-			)
+    local directBall = workspace:FindFirstChild(BALL_NAME)
+    if directBall then
+        if directBall:IsA("BasePart") then return directBall end
+        local p = directBall:FindFirstChildWhichIsA("BasePart", true)
+        if p then return p end
+    end
 
-		if
-			ball
-			and ball:IsA("BasePart")
-		then
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and string.lower(obj.Name) == string.lower(BALL_NAME) then
+            return obj
+        end
+    end
 
-			return ball
-		end
-	end
+    return nil
+end
 
-	-- Model player trong Workspace
-	local playerModel =
-		workspace:FindFirstChild(
-			player.Name
-		)
+local function findBallHolder()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isMatchPlayer(plr) and plr.Character then
+            local ball = plr.Character:FindFirstChild(BALL_NAME, true)
+            if ball and ball:IsA("BasePart") then
+                return plr, ball
+            end
+            for _, obj in ipairs(plr.Character:GetDescendants()) do
+                if obj:IsA("BasePart") and string.lower(obj.Name) == string.lower(BALL_NAME) then
+                    return plr, obj
+                end
+            end
+        end
+    end
+    return nil, nil
+end
 
-	if playerModel then
+local function getBallState()
+    local holder, heldBall = findBallHolder()
+    local looseBall = findBall()
 
-		local ball =
-			playerModel:FindFirstChild(
-				BALL_NAME,
-				true
-			)
+    if holder then
+        return "HELD", holder, heldBall
+    end
 
-		if
-			ball
-			and ball:IsA("BasePart")
-		then
+    if looseBall then
+        return "FREE", nil, looseBall
+    end
 
-			return ball
-		end
-	end
+    return "MISSING", nil, nil
+end
 
-	-- Ball trực tiếp trong Workspace
-	local ball =
-		workspace:FindFirstChild(
-			BALL_NAME
-		)
+local function localHasBall()
+    local holder = findBallHolder()
+    return holder == player
+end
 
-	if
-		ball
-		and ball:IsA("BasePart")
-	then
+local function getPlayerRoot(plr)
+    if not plr or not plr.Character then return nil end
+    return plr.Character:FindFirstChild("HumanoidRootPart")
+end
 
-		return ball
-	end
-
-	-- Fallback
-	for _, obj in ipairs(
-		workspace:GetDescendants()
-	) do
-
-		if
-			obj:IsA("BasePart")
-			and obj.Name == BALL_NAME
-		then
-
-			return obj
-		end
-	end
-
-	return nil
+local function sameTeam(plr)
+    return plr and player.Team and plr.Team == player.Team
 end
 
 --========================================================--
--- CAMERA
+-- NOTIFICATIONS
 --========================================================--
 
-local camera =
-	workspace.CurrentCamera
+local notificationHolder
 
-local savedCameraType = nil
-local savedCameraSubject = nil
+local function notify(titleText, bodyText, duration)
+    duration = duration or 2.2
+    if not notificationHolder or not notificationHolder.Parent then return end
 
-local function saveCamera()
+    local card = Instance.new("Frame")
+    card.Size = UDim2.fromOffset(280, 58)
+    card.AnchorPoint = Vector2.new(0.5, 0)
+    card.Position = UDim2.new(0.5, 0, 0, -65)
+    card.BackgroundColor3 = Color3.fromRGB(27,27,34)
+    card.BorderSizePixel = 0
+    card.Parent = notificationHolder
 
-	savedCameraType =
-		camera.CameraType
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0,9)
+    corner.Parent = card
 
-	savedCameraSubject =
-		camera.CameraSubject
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(65,65,80)
+    stroke.Transparency = 0.15
+    stroke.Parent = card
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1,-18,0,22)
+    title.Position = UDim2.fromOffset(9,5)
+    title.BackgroundTransparency = 1
+    title.Text = tostring(titleText)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextColor3 = Color3.fromRGB(255,255,255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = card
+
+    local body = Instance.new("TextLabel")
+    body.Size = UDim2.new(1,-18,0,25)
+    body.Position = UDim2.fromOffset(9,27)
+    body.BackgroundTransparency = 1
+    body.Text = tostring(bodyText)
+    body.Font = Enum.Font.Gotham
+    body.TextSize = 11
+    body.TextColor3 = Color3.fromRGB(175,175,185)
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.Parent = card
+
+    local inTween = TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+        Position = UDim2.new(0.5,0,0,8)
+    })
+    inTween:Play()
+
+    task.delay(duration, function()
+        -- GUI/card có thể đã bị reset hoặc destroy trong lúc chờ.
+        if not card or not card.Parent or not notificationHolder or not notificationHolder.Parent then
+            return
+        end
+
+        local outTween = TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+            Position = UDim2.new(0.5,0,0,-65)
+        })
+        outTween:Play()
+
+        -- Không dùng Completed:Wait(); tự dọn card sau thời gian tween.
+        task.delay(0.22, function()
+            if card and card.Parent then
+                card:Destroy()
+            end
+        end)
+    end)
 end
 
-local function cameraToBall(ball)
+--========================================================--
+-- GUI HELPERS
+--========================================================--
 
-	if not ball then
-		return
-	end
+local gui = Instance.new("ScreenGui")
+gui.Name = "BallController"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
 
-	if savedCameraType == nil then
-
-		saveCamera()
-	end
-
-	camera.CameraType =
-		Enum.CameraType.Custom
-
-	camera.CameraSubject =
-		ball
+local function corner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = parent
+    return c
 end
 
-local function restoreCamera()
-
-	updateCharacter()
-
-	local hum = humanoid
-
-	camera.CameraType =
-		savedCameraType
-		or Enum.CameraType.Custom
-
-	if hum then
-
-		camera.CameraSubject =
-			hum
-
-	elseif savedCameraSubject then
-
-		camera.CameraSubject =
-			savedCameraSubject
-
-	end
-
-	savedCameraType = nil
-	savedCameraSubject = nil
+local function stroke(parent, color, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Color3.fromRGB(60,60,70)
+    s.Transparency = transparency or 0.2
+    s.Parent = parent
+    return s
 end
 
---========================================================--
--- GUI
---========================================================--
+local function makeButton(parent, text, x, y, w, h)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(w,h)
+    b.Position = UDim2.fromOffset(x,y)
+    b.BackgroundColor3 = Color3.fromRGB(43,43,51)
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(235,235,240)
+    b.TextSize = 12
+    b.Font = Enum.Font.GothamMedium
+    b.AutoButtonColor = true
+    b.Parent = parent
+    corner(b,7)
+    return b
+end
 
-local gui =
-	Instance.new("ScreenGui")
+local function makeLabel(parent, text, x, y, w, h, size)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.fromOffset(w,h)
+    l.Position = UDim2.fromOffset(x,y)
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = Color3.fromRGB(205,205,215)
+    l.TextSize = size or 12
+    l.Font = Enum.Font.GothamMedium
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = parent
+    return l
+end
 
-gui.Name =
-	"BallController"
+local function makeBox(parent, value, x, y, w, h)
+    local b = Instance.new("TextBox")
+    b.Size = UDim2.fromOffset(w,h)
+    b.Position = UDim2.fromOffset(x,y)
+    b.BackgroundColor3 = Color3.fromRGB(40,40,47)
+    b.BorderSizePixel = 0
+    b.Text = tostring(value)
+    b.TextColor3 = Color3.fromRGB(255,255,255)
+    b.PlaceholderColor3 = Color3.fromRGB(130,130,140)
+    b.TextSize = 12
+    b.Font = Enum.Font.GothamMedium
+    b.ClearTextOnFocus = false
+    b.Parent = parent
+    corner(b,7)
+    return b
+end
 
-gui.ResetOnSpawn =
-	false
-
-gui.IgnoreGuiInset =
-	true
-
-gui.ZIndexBehavior =
-	Enum.ZIndexBehavior.Sibling
-
-gui.Parent =
-	playerGui
-
---========================================================--
--- MAIN
---========================================================--
-
-local main =
-	Instance.new("Frame")
-
-main.Name =
-	"Main"
-
-main.Size =
-	UDim2.fromOffset(
-		330,
-		330
-	)
-
-main.Position =
-	UDim2.new(
-		0,
-		25,
-		0.5,
-		-165
-	)
-
-main.BackgroundColor3 =
-	Color3.fromRGB(
-		24,
-		24,
-		29
-	)
-
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(350,390)
+main.Position = UDim2.new(0,25,0.5,-195)
+main.BackgroundColor3 = Color3.fromRGB(24,24,29)
 main.BorderSizePixel = 0
 main.Parent = gui
+corner(main,12)
+stroke(main, Color3.fromRGB(60,60,70), 0.2)
 
-local mainCorner =
-	Instance.new("UICorner")
+local title = makeLabel(main, "⚽  BALL CONTROLLER V3", 10, 5, 260, 35, 18)
+title.Font = Enum.Font.GothamBold
 
-mainCorner.CornerRadius =
-	UDim.new(
-		0,
-		12
-	)
-
-mainCorner.Parent =
-	main
-
-local mainStroke =
-	Instance.new("UIStroke")
-
-mainStroke.Color =
-	Color3.fromRGB(
-		60,
-		60,
-		70
-	)
-
-mainStroke.Thickness = 1
-mainStroke.Transparency = 0.2
-
-mainStroke.Parent =
-	main
-
---========================================================--
--- TITLE
---========================================================--
-
-local title =
-	Instance.new("TextLabel")
-
-title.Size =
-	UDim2.new(
-		1,
-		-55,
-		0,
-		40
-	)
-
-title.Position =
-	UDim2.fromOffset(
-		10,
-		5
-	)
-
-title.BackgroundTransparency = 1
-
-title.Text =
-	"⚽  BALL CONTROLLER"
-
-title.TextColor3 =
-	Color3.fromRGB(
-		255,
-		255,
-		255
-	)
-
-title.TextSize = 18
-title.Font =
-	Enum.Font.GothamBold
-
-title.TextXAlignment =
-	Enum.TextXAlignment.Left
-
-title.Parent =
-	main
-
---========================================================--
--- MINIMIZE
---========================================================--
-
-local minimizeButton =
-	Instance.new("TextButton")
-
-minimizeButton.Name =
-	"Minimize"
-
-minimizeButton.Size =
-	UDim2.fromOffset(
-		28,
-		28
-	)
-
-minimizeButton.Position =
-	UDim2.new(
-		1,
-		-38,
-		0,
-		10
-	)
-
-minimizeButton.BackgroundColor3 =
-	Color3.fromRGB(
-		43,
-		43,
-		51
-	)
-
-minimizeButton.BorderSizePixel = 0
-
-minimizeButton.Text =
-	"—"
-
-minimizeButton.TextColor3 =
-	Color3.fromRGB(
-		235,
-		235,
-		240
-	)
-
+local minimizeButton = makeButton(main, "—", 312, 10, 28, 28)
 minimizeButton.TextSize = 18
-minimizeButton.Font =
-	Enum.Font.GothamBold
 
-minimizeButton.Parent =
-	main
+local statusLabel = makeLabel(main, "Status: OFF", 10, 42, 320, 22, 13)
+local ballStatus = makeLabel(main, "BALL: SEARCHING...", 10, 64, 320, 22, 12)
 
-local minimizeCorner =
-	Instance.new("UICorner")
+local controlButton = makeButton(main, "CONTROL KEY: F", 10, 92, 160, 36)
+local modeButton = makeButton(main, "MODE: 1", 180, 92, 160, 36)
+local anchorButton = makeButton(main, "ANCHOR: ON", 10, 136, 160, 36)
+local forceUnanchorButton = makeButton(main, "FORCE UNANCHOR", 180, 136, 160, 36)
+local stealButton = makeButton(main, "STEAL BALL: OFF", 10, 180, 160, 36)
+local saeButton = makeButton(main, "SAE PASS: OFF", 180, 180, 160, 36)
+local settingsButton = makeButton(main, "⚙ SETTINGS", 10, 224, 160, 36)
+local lockButton = makeButton(main, "LOCK PLAYER: OFF", 180, 224, 160, 36)
 
-minimizeCorner.CornerRadius =
-	UDim.new(
-		0,
-		7
-	)
+local info = makeLabel(main,
+    "Control key = nhấn để kích hoạt thao tác control / mode 3-4.\n" ..
+    "WASDEQ: điều khiển khi mode 1/2 đang active.\n" ..
+    "Sae Pass: giữ chuột trái + Control Key để chọn / chuyền.",
+    10, 270, 330, 88, 11)
+info.TextWrapped = true
+info.TextYAlignment = Enum.TextYAlignment.Top
+info.TextColor3 = Color3.fromRGB(145,145,155)
 
-minimizeCorner.Parent =
-	minimizeButton
+local restoreButton = makeButton(gui, "⚽", 0, 0, 48, 48)
+restoreButton.Visible = false
+restoreButton.TextSize = 23
+corner(restoreButton,24)
+stroke(restoreButton, Color3.fromRGB(65,65,75), 0.1)
 
---========================================================--
--- STATUS
---========================================================--
+notificationHolder = Instance.new("Frame")
+notificationHolder.Name = "Notifications"
+notificationHolder.Size = UDim2.fromOffset(320,300)
+notificationHolder.AnchorPoint = Vector2.new(0.5,0)
+notificationHolder.Position = UDim2.new(0.5,0,0,0)
+notificationHolder.BackgroundTransparency = 1
+notificationHolder.Parent = gui
 
-local status =
-	Instance.new("TextLabel")
-
-status.Size =
-	UDim2.new(
-		1,
-		-20,
-		0,
-		22
-	)
-
-status.Position =
-	UDim2.fromOffset(
-		10,
-		42
-	)
-
-status.BackgroundTransparency = 1
-
-status.Text =
-	"Status: OFF"
-
-status.TextColor3 =
-	Color3.fromRGB(
-		255,
-		100,
-		100
-	)
-
-status.TextSize = 13
-status.Font =
-	Enum.Font.GothamMedium
-
-status.TextXAlignment =
-	Enum.TextXAlignment.Left
-
-status.Parent =
-	main
+local notificationLayout = Instance.new("UIListLayout")
+notificationLayout.Padding = UDim.new(0,7)
+notificationLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+notificationLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+notificationLayout.Parent = notificationHolder
 
 --========================================================--
--- BUTTON CREATOR
+-- SETTINGS PANEL
 --========================================================--
 
-local function makeButton(
-	text,
-	x,
-	y,
-	width,
-	height
-)
+local settingsFrame = Instance.new("Frame")
+settingsFrame.Name = "Settings"
+settingsFrame.Size = UDim2.fromOffset(390,320)
+settingsFrame.Position = UDim2.new(0,390,0.5,-160)
+settingsFrame.BackgroundColor3 = Color3.fromRGB(22,22,27)
+settingsFrame.BorderSizePixel = 0
+settingsFrame.Visible = false
+settingsFrame.Parent = gui
+corner(settingsFrame,12)
+stroke(settingsFrame, Color3.fromRGB(60,60,70), 0.15)
 
-	local button =
-		Instance.new("TextButton")
+local settingsTitle = makeLabel(settingsFrame, "⚙ BALL SETTINGS", 12, 8, 270, 32, 17)
+settingsTitle.Font = Enum.Font.GothamBold
+local closeSettings = makeButton(settingsFrame, "X", 350, 8, 28, 28)
 
-	button.Size =
-		UDim2.fromOffset(
-			width,
-			height
-		)
-
-	button.Position =
-		UDim2.fromOffset(
-			x,
-			y
-		)
-
-	button.BackgroundColor3 =
-		Color3.fromRGB(
-			43,
-			43,
-			51
-		)
-
-	button.BorderSizePixel = 0
-
-	button.Text =
-		text
-
-	button.TextColor3 =
-		Color3.fromRGB(
-			235,
-			235,
-			240
-		)
-
-	button.TextSize = 12
-
-	button.Font =
-		Enum.Font.GothamMedium
-
-	button.Parent =
-		main
-
-	local corner =
-		Instance.new("UICorner")
-
-	corner.CornerRadius =
-		UDim.new(
-			0,
-			7
-		)
-
-	corner.Parent =
-		button
-
-	return button
+local tabs = {}
+local tabNames = {"MODE 1", "MODE 2", "MODE 3", "MODE 4"}
+for i, name in ipairs(tabNames) do
+    tabs[i] = makeButton(settingsFrame, name, 10 + (i-1)*94, 48, 86, 30)
 end
 
---========================================================--
--- CONTROL
---========================================================--
-
-local controlButton =
-	makeButton(
-		"CONTROL: OFF",
-		10,
-		72,
-		150,
-		36
-	)
-
---========================================================--
--- HOTKEY
---========================================================--
-
-local hotkeyButton =
-	makeButton(
-		"HOTKEY: F",
-		170,
-		72,
-		150,
-		36
-	)
-
---========================================================--
--- MODE
---========================================================--
-
-local modeButton =
-	makeButton(
-		"MODE: 1 [WASD]",
-		10,
-		116,
-		150,
-		36
-	)
-
---========================================================--
--- AUTO LOCK
---========================================================--
-
-local autoLockButton =
-	makeButton(
-		"AUTO LOCK: ON",
-		170,
-		116,
-		150,
-		36
-	)
-
---========================================================--
--- LOCK NOW
---========================================================--
-
-local lockButton =
-	makeButton(
-		"LOCK NOW: OFF",
-		10,
-		160,
-		150,
-		36
-	)
-
---========================================================--
--- BALL STATUS
---========================================================--
-
-local ballStatus =
-	Instance.new("TextLabel")
-
-ballStatus.Size =
-	UDim2.fromOffset(
-		150,
-		36
-	)
-
-ballStatus.Position =
-	UDim2.fromOffset(
-		170,
-		160
-	)
-
-ballStatus.BackgroundTransparency =
-	1
-
-ballStatus.Text =
-	"BALL: SEARCHING..."
-
-ballStatus.TextColor3 =
-	Color3.fromRGB(
-		160,
-		160,
-		170
-	)
-
-ballStatus.TextSize = 11
-ballStatus.Font =
-	Enum.Font.Gotham
-
-ballStatus.TextXAlignment =
-	Enum.TextXAlignment.Center
-
-ballStatus.TextYAlignment =
-	Enum.TextYAlignment.Center
-
-ballStatus.Parent =
-	main
-
---========================================================--
--- SPEED
---========================================================--
-
-local speedLabel =
-	Instance.new("TextLabel")
-
-speedLabel.Size =
-	UDim2.fromOffset(
-		90,
-		30
-	)
-
-speedLabel.Position =
-	UDim2.fromOffset(
-		10,
-		208
-	)
-
-speedLabel.BackgroundTransparency =
-	1
-
-speedLabel.Text =
-	"SPEED"
-
-speedLabel.TextColor3 =
-	Color3.fromRGB(
-		210,
-		210,
-		220
-	)
-
-speedLabel.TextSize = 12
-
-speedLabel.Font =
-	Enum.Font.GothamMedium
-
-speedLabel.TextXAlignment =
-	Enum.TextXAlignment.Left
-
-speedLabel.Parent =
-	main
-
-local speedBox =
-	Instance.new("TextBox")
-
-speedBox.Size =
-	UDim2.fromOffset(
-		220,
-		32
-	)
-
-speedBox.Position =
-	UDim2.fromOffset(
-		100,
-		207
-	)
-
-speedBox.BackgroundColor3 =
-	Color3.fromRGB(
-		40,
-		40,
-		47
-	)
-
-speedBox.BorderSizePixel = 0
-
-speedBox.Text =
-	tostring(
-		DEFAULT_SPEED
-	)
-
-speedBox.PlaceholderText =
-	"Speed"
-
-speedBox.TextColor3 =
-	Color3.fromRGB(
-		255,
-		255,
-		255
-	)
-
-speedBox.PlaceholderColor3 =
-	Color3.fromRGB(
-		130,
-		130,
-		140
-	)
-
-speedBox.TextSize = 13
-
-speedBox.Font =
-	Enum.Font.GothamMedium
-
-speedBox.ClearTextOnFocus =
-	false
-
-speedBox.Parent =
-	main
-
-local speedCorner =
-	Instance.new("UICorner")
-
-speedCorner.CornerRadius =
-	UDim.new(
-		0,
-		7
-	)
-
-speedCorner.Parent =
-	speedBox
-
---========================================================--
--- INFO
---========================================================--
-
-local info =
-	Instance.new("TextLabel")
-
-info.Size =
-	UDim2.new(
-		1,
-		-20,
-		0,
-		60
-	)
-
-info.Position =
-	UDim2.fromOffset(
-		10,
-		255
-	)
-
-info.BackgroundTransparency =
-	1
-
-info.Text =
-	"Mode 1: WASD + Q/E\n"
-	.. "Mode 2: Camera direction only\n"
-	.. "Hotkey toggles controller"
-
-info.TextColor3 =
-	Color3.fromRGB(
-		145,
-		145,
-		155
-	)
-
-info.TextSize = 11
-
-info.Font =
-	Enum.Font.Gotham
-
-info.TextWrapped =
-	true
-
-info.TextXAlignment =
-	Enum.TextXAlignment.Left
-
-info.TextYAlignment =
-	Enum.TextYAlignment.Top
-
-info.Parent =
-	main
-
---========================================================--
--- RESTORE BUTTON
---========================================================--
-
-local restoreButton =
-	Instance.new("TextButton")
-
-restoreButton.Name =
-	"Restore"
-
-restoreButton.Size =
-	UDim2.fromOffset(
-		48,
-		48
-	)
-
-restoreButton.Position =
-	main.Position
-
-restoreButton.BackgroundColor3 =
-	Color3.fromRGB(
-		30,
-		30,
-		36
-	)
-
-restoreButton.BorderSizePixel =
-	0
-
-restoreButton.Text =
-	"⚽"
-
-restoreButton.TextColor3 =
-	Color3.fromRGB(
-		255,
-		255,
-		255
-	)
-
-restoreButton.TextSize =
-	23
-
-restoreButton.Font =
-	Enum.Font.GothamBold
-
-restoreButton.Visible =
-	false
-
-restoreButton.Parent =
-	gui
-
-local restoreCorner =
-	Instance.new("UICorner")
-
-restoreCorner.CornerRadius =
-	UDim.new(
-		1,
-		0
-	)
-
-restoreCorner.Parent =
-	restoreButton
-
-local restoreStroke =
-	Instance.new("UIStroke")
-
-restoreStroke.Color =
-	Color3.fromRGB(
-		65,
-		65,
-		75
-	)
-
-restoreStroke.Thickness = 1
-
-restoreStroke.Parent =
-	restoreButton
+local settingsContent = Instance.new("Frame")
+settingsContent.Size = UDim2.new(1,-20,1,-90)
+settingsContent.Position = UDim2.fromOffset(10,88)
+settingsContent.BackgroundTransparency = 1
+settingsContent.Parent = settingsFrame
+
+local speedLabels = {}
+local speedBoxes = {}
+local heightLabel = makeLabel(settingsContent, "HEIGHT", 10, 56, 100, 25, 12)
+local curveLabel = makeLabel(settingsContent, "CURVE", 10, 106, 100, 25, 12)
+local heightBox = makeBox(settingsContent, modeSettings[3].height, 120, 52, 220, 32)
+local curveBox = makeBox(settingsContent, modeSettings[3].curve, 120, 102, 220, 32)
+local settingsHint = makeLabel(settingsContent, "", 10, 160, 350, 60, 11)
+settingsHint.TextWrapped = true
+settingsHint.TextColor3 = Color3.fromRGB(145,145,155)
+
+for i = 1,4 do
+    speedLabels[i] = makeLabel(settingsContent, "SPEED", 10, 10, 100, 25, 12)
+    speedBoxes[i] = makeBox(settingsContent, modeSettings[i].speed, 120, 6, 220, 32)
+    speedLabels[i].Visible = false
+    speedBoxes[i].Visible = false
+end
+
+heightLabel.Visible = false
+curveLabel.Visible = false
+heightBox.Visible = false
+curveBox.Visible = false
+
+local selectedSettingsTab = 1
+
+local function parseSetting(box, oldValue, minValue, maxValue)
+    local n = tonumber(box.Text)
+    if not n then
+        box.Text = tostring(oldValue)
+        return oldValue
+    end
+    n = math.clamp(n, minValue, maxValue)
+    box.Text = tostring(n)
+    return n
+end
+
+local function refreshSettingsPanel()
+    for i=1,4 do
+        speedLabels[i].Visible = (selectedSettingsTab == i)
+        speedBoxes[i].Visible = (selectedSettingsTab == i)
+    end
+    local mode3 = selectedSettingsTab == 3
+    heightLabel.Visible = mode3
+    curveLabel.Visible = mode3
+    heightBox.Visible = mode3
+    curveBox.Visible = mode3
+
+    if selectedSettingsTab == 1 then
+        settingsHint.Text = "Mode 1: tốc độ chuyển động ngang + dọc của bóng theo WASDEQ."
+    elseif selectedSettingsTab == 2 then
+        settingsHint.Text = "Mode 2: tốc độ bóng theo hướng camera."
+    elseif selectedSettingsTab == 3 then
+        settingsHint.Text = "Mode 3: HEIGHT = bóng bay thẳng đứng lên tại vị trí sút; CURVE = độ cong quỹ đạo."
+    elseif selectedSettingsTab == 4 then
+        settingsHint.Text = "Mode 4: velocity được truyền một lần, sau đó script không can thiệp bóng nữa."
+    end
+end
+
+for i=1,4 do
+    tabs[i].MouseButton1Click:Connect(function()
+        selectedSettingsTab = i
+        refreshSettingsPanel()
+    end)
+    speedBoxes[i].FocusLost:Connect(function()
+        modeSettings[i].speed = parseSetting(speedBoxes[i], modeSettings[i].speed, MIN_SPEED, MAX_SPEED)
+    end)
+end
+
+heightBox.FocusLost:Connect(function()
+    modeSettings[3].height = parseSetting(heightBox, modeSettings[3].height, 0, 2000)
+end)
+
+curveBox.FocusLost:Connect(function()
+    modeSettings[3].curve = parseSetting(curveBox, modeSettings[3].curve, -1000, 1000)
+end)
 
 --========================================================--
 -- DRAG
 --========================================================--
 
-local function makeDraggable(
-	object,
-	handle
-)
+local function makeDraggable(object, handle)
+    local dragging = false
+    local dragStart
+    local startPosition
 
-	local dragging = false
-	local dragStart
-	local startPosition
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        dragging = true
+        dragStart = input.Position
+        startPosition = object.Position
 
-	handle.InputBegan:Connect(
-		function(input)
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end)
 
-			if
-				input.UserInputType
-				~=
-				Enum.UserInputType.MouseButton1
-			then
-
-				return
-			end
-
-			dragging =
-				true
-
-			dragStart =
-				input.Position
-
-			startPosition =
-				object.Position
-
-			input.Changed:Connect(
-				function()
-
-					if
-						input.UserInputState
-						==
-						Enum.UserInputState.End
-					then
-
-						dragging =
-							false
-					end
-
-				end
-			)
-		end
-	)
-
-	UserInputService.InputChanged:Connect(
-		function(input)
-
-			if not dragging then
-				return
-			end
-
-			if
-				input.UserInputType
-				~=
-				Enum.UserInputType.MouseMovement
-			then
-
-				return
-			end
-
-			local delta =
-				input.Position
-				- dragStart
-
-			object.Position =
-				UDim2.new(
-					startPosition.X.Scale,
-					startPosition.X.Offset
-						+ delta.X,
-
-					startPosition.Y.Scale,
-					startPosition.Y.Offset
-						+ delta.Y
-				)
-		end
-	)
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging or input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local delta = input.Position - dragStart
+        object.Position = UDim2.new(
+            startPosition.X.Scale, startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+        )
+    end)
 end
 
-makeDraggable(
-	main,
-	title
-)
-
-makeDraggable(
-	restoreButton,
-	restoreButton
-)
+makeDraggable(main, title)
+makeDraggable(settingsFrame, settingsTitle)
+makeDraggable(restoreButton, restoreButton)
 
 --========================================================--
--- MINIMIZE
+-- MINIMIZE / SETTINGS
 --========================================================--
 
-minimizeButton.MouseButton1Click:Connect(
-	function()
+minimizeButton.MouseButton1Click:Connect(function()
+    minimized = true
+    restoreButton.Position = main.Position
+    main.Visible = false
+    settingsFrame.Visible = false
+    restoreButton.Visible = true
+end)
 
-		minimized =
-			true
+restoreButton.MouseButton1Click:Connect(function()
+    minimized = false
+    main.Visible = true
+    restoreButton.Visible = false
+end)
 
-		restoreButton.Position =
-			main.Position
+settingsButton.MouseButton1Click:Connect(function()
+    settingsOpen = not settingsOpen
+    settingsFrame.Visible = settingsOpen and not minimized
+    refreshSettingsPanel()
+end)
 
-		main.Visible =
-			false
-
-		restoreButton.Visible =
-			true
-	end
-)
-
-restoreButton.MouseButton1Click:Connect(
-	function()
-
-		minimized =
-			false
-
-		main.Position =
-			restoreButton.Position
-
-		restoreButton.Visible =
-			false
-
-		main.Visible =
-			true
-	end
-)
+closeSettings.MouseButton1Click:Connect(function()
+    settingsOpen = false
+    settingsFrame.Visible = false
+end)
 
 --========================================================--
 -- UI UPDATE
 --========================================================--
 
+local function modeName()
+    if mode == 1 then return "MODE 1 [CAMERA WASDEQ]" end
+    if mode == 2 then return "MODE 2 [CAMERA]" end
+    if mode == 3 then return "MODE 3 [EXTREME CURVE]" end
+    return "MODE 4 [RONALDO]"
+end
+
 local function updateUI()
+    controlButton.Text = "CONTROL KEY: " .. controlKey.Name
+    modeButton.Text = modeName()
 
-	if enabled then
+    if enabled then
+        statusLabel.Text = "Status: ACTIVE"
+        statusLabel.TextColor3 = Color3.fromRGB(100,255,130)
+    else
+        statusLabel.Text = "Status: READY"
+        statusLabel.TextColor3 = Color3.fromRGB(255,205,100)
+    end
 
-		controlButton.Text =
-			"CONTROL: ON"
+    anchorButton.Text = anchorEnabled and "ANCHOR: ON" or "ANCHOR: OFF"
+    anchorButton.TextColor3 = anchorEnabled and Color3.fromRGB(100,255,130) or Color3.fromRGB(255,100,100)
 
-		controlButton.TextColor3 =
-			Color3.fromRGB(
-				100,
-				255,
-				130
-			)
+    stealButton.Text = stealBallEnabled and "STEAL BALL: ON" or "STEAL BALL: OFF"
+    stealButton.TextColor3 = stealBallEnabled and Color3.fromRGB(100,255,130) or Color3.fromRGB(255,100,100)
 
-		status.Text =
-			"Status: ON"
+    saeButton.Text = saePassEnabled and "SAE PASS: ON" or "SAE PASS: OFF"
+    saeButton.TextColor3 = saePassEnabled and Color3.fromRGB(100,255,130) or Color3.fromRGB(255,100,100)
 
-		status.TextColor3 =
-			Color3.fromRGB(
-				100,
-				255,
-				130
-			)
-
-	else
-
-		controlButton.Text =
-			"CONTROL: OFF"
-
-		controlButton.TextColor3 =
-			Color3.fromRGB(
-				255,
-				100,
-				100
-			)
-
-		status.Text =
-			"Status: OFF"
-
-		status.TextColor3 =
-			Color3.fromRGB(
-				255,
-				100,
-				100
-			)
-	end
-
-	if mode == 1 then
-
-		modeButton.Text =
-			"MODE: 1 [WASD]"
-
-	else
-
-		modeButton.Text =
-			"MODE: 2 [CAMERA]"
-	end
-
-	if autoLock then
-
-		autoLockButton.Text =
-			"AUTO LOCK: ON"
-
-		autoLockButton.TextColor3 =
-			Color3.fromRGB(
-				100,
-				255,
-				130
-			)
-
-	else
-
-		autoLockButton.Text =
-			"AUTO LOCK: OFF"
-
-		autoLockButton.TextColor3 =
-			Color3.fromRGB(
-				255,
-				100,
-				100
-			)
-	end
-
-	if manualLock then
-
-		lockButton.Text =
-			"LOCK NOW: ON"
-
-		lockButton.TextColor3 =
-			Color3.fromRGB(
-				100,
-				255,
-				130
-			)
-
-	else
-
-		lockButton.Text =
-			"LOCK NOW: OFF"
-
-		lockButton.TextColor3 =
-			Color3.fromRGB(
-				255,
-				100,
-				100
-			)
-	end
-
-	if changingHotkey then
-
-		hotkeyButton.Text =
-			"PRESS A KEY..."
-
-	else
-
-		hotkeyButton.Text =
-			"HOTKEY: "
-			.. hotkey.Name
-	end
-end
-
-updateUI()
-
---========================================================--
--- ENABLE / DISABLE
---========================================================--
-
-local function setEnabled(state)
-
-	enabled =
-		state
-
-	updateCharacter()
-
-	if enabled then
-
-		-- Lock nếu AutoLock hoặc ManualLock
-		updateLock()
-
-		if mode == 2 then
-
-			local ball =
-				findBall()
-
-			if ball then
-				cameraToBall(ball)
-			end
-		end
-
-	else
-
-		-- Reset input
-		keys.W = false
-		keys.A = false
-		keys.S = false
-		keys.D = false
-		keys.Q = false
-		keys.E = false
-
-		-- Khi tắt control,
-		-- Manual Lock cũng phải tắt
-		manualLock =
-			false
-
-		-- Thả lock của script
-		forceUnlock()
-
-		-- Trả camera
-		restoreCamera()
-
-		-- Dừng horizontal velocity của bóng
-		local ball =
-			findBall()
-
-		if ball then
-
-			local velocity =
-				ball.AssemblyLinearVelocity
-
-			ball.AssemblyLinearVelocity =
-				Vector3.new(
-					0,
-					velocity.Y,
-					0
-				)
-		end
-	end
-
-	updateUI()
+    lockButton.Text = playerWasLocked and "LOCK PLAYER: ON" or "LOCK PLAYER: OFF"
+    lockButton.TextColor3 = playerWasLocked and Color3.fromRGB(100,255,130) or Color3.fromRGB(255,100,100)
 end
 
 --========================================================--
--- CONTROL BUTTON
+-- CAMERA / TARGET
 --========================================================--
 
-controlButton.MouseButton1Click:Connect(
-	function()
-
-		setEnabled(
-			not enabled
-		)
-	end
-)
-
---========================================================--
--- MODE
---========================================================--
-
-modeButton.MouseButton1Click:Connect(
-	function()
-
-		mode += 1
-
-		if mode > 2 then
-			mode = 1
-		end
-
-		if enabled then
-
-			if mode == 2 then
-
-				local ball =
-					findBall()
-
-				if ball then
-					cameraToBall(ball)
-				end
-
-			else
-
-				restoreCamera()
-			end
-		end
-
-		updateUI()
-	end
-)
-
---========================================================--
--- AUTO LOCK
---========================================================--
-
-autoLockButton.MouseButton1Click:Connect(
-	function()
-
-		autoLock =
-			not autoLock
-
-		if autoLock then
-
-			-- Bật AutoLock
-			if enabled then
-				lockPlayer()
-			end
-
-		else
-
-			-- Tắt AutoLock
-			-- Nếu ManualLock không bật
-			-- thì thả ngay
-			if not manualLock then
-				forceUnlock()
-			end
-		end
-
-		updateUI()
-	end
-)
-
---========================================================--
--- LOCK NOW
---========================================================--
-
-lockButton.MouseButton1Click:Connect(
-	function()
-
-		manualLock =
-			not manualLock
-
-		if manualLock then
-
-			lockPlayer()
-
-		else
-
-			-- AutoLock đang ON + Control ON
-			-- thì vẫn phải lock
-			if enabled and autoLock then
-
-				lockPlayer()
-
-			else
-
-				forceUnlock()
-
-			end
-		end
-
-		updateUI()
-	end
-)
-
---========================================================--
--- SPEED
---========================================================--
-
-speedBox.FocusLost:Connect(
-	function()
-
-		local value =
-			tonumber(
-				speedBox.Text
-			)
-
-		if not value then
-
-			speedBox.Text =
-				tostring(speed)
-
-			return
-		end
-
-		value =
-			math.clamp(
-				value,
-				MIN_SPEED,
-				MAX_SPEED
-			)
-
-		speed =
-			value
-
-		speedBox.Text =
-			tostring(value)
-	end
-)
-
---========================================================--
--- HOTKEY
---========================================================--
-
-hotkeyButton.MouseButton1Click:Connect(
-	function()
-
-		changingHotkey =
-			true
-
-		updateUI()
-	end
-)
-
---========================================================--
--- INPUT BEGAN
---========================================================--
-
-UserInputService.InputBegan:Connect(
-	function(
-		input,
-		gameProcessed
-	)
-
-		if
-			input.UserInputType
-			~=
-			Enum.UserInputType.Keyboard
-		then
-
-			return
-		end
-
-		--====================================--
-		-- ĐỔI HOTKEY
-		--====================================--
-
-		if changingHotkey then
-
-			if
-				input.KeyCode
-				==
-				Enum.KeyCode.Escape
-			then
-
-				changingHotkey =
-					false
-
-				updateUI()
-
-				return
-			end
-
-			if
-				input.KeyCode
-				~=
-				Enum.KeyCode.Unknown
-			then
-
-				hotkey =
-					input.KeyCode
-
-				changingHotkey =
-					false
-
-				updateUI()
-
-				return
-			end
-		end
-
-		--====================================--
-		-- CONTROLLER HOTKEY
-		--====================================--
-
-		if
-			input.KeyCode
-			==
-			hotkey
-		then
-
-			setEnabled(
-				not enabled
-			)
-
-			return
-		end
-
-		if gameProcessed then
-			return
-		end
-
-		--====================================--
-		-- MOVEMENT KEYS
-		--====================================--
-
-		if
-			input.KeyCode
-			==
-			Enum.KeyCode.W
-		then
-
-			keys.W = true
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.A
-		then
-
-			keys.A = true
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.S
-		then
-
-			keys.S = true
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.D
-		then
-
-			keys.D = true
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.Q
-		then
-
-			keys.Q = true
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.E
-		then
-
-			keys.E = true
-		end
-	end
-)
-
---========================================================--
--- INPUT ENDED
---========================================================--
-
-UserInputService.InputEnded:Connect(
-	function(input)
-
-		if
-			input.UserInputType
-			~=
-			Enum.UserInputType.Keyboard
-		then
-
-			return
-		end
-
-		if
-			input.KeyCode
-			==
-			Enum.KeyCode.W
-		then
-
-			keys.W = false
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.A
-		then
-
-			keys.A = false
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.S
-		then
-
-			keys.S = false
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.D
-		then
-
-			keys.D = false
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.Q
-		then
-
-			keys.Q = false
-
-		elseif
-			input.KeyCode
-			==
-			Enum.KeyCode.E
-		then
-
-			keys.E = false
-		end
-	end
-)
-
---========================================================--
--- CAMERA DIRECTIONS
---========================================================--
-
-local function getFlatDirections()
-
-	local cf =
-		camera.CFrame
-
-	local forward =
-		Vector3.new(
-			cf.LookVector.X,
-			0,
-			cf.LookVector.Z
-		)
-
-	local right =
-		Vector3.new(
-			cf.RightVector.X,
-			0,
-			cf.RightVector.Z
-		)
-
-	if forward.Magnitude > 0 then
-
-		forward =
-			forward.Unit
-	end
-
-	if right.Magnitude > 0 then
-
-		right =
-			right.Unit
-	end
-
-	return forward, right
+local camera = workspace.CurrentCamera
+local savedCameraType
+local savedCameraSubject
+
+local function saveCamera(ballSubject)
+    camera = workspace.CurrentCamera
+    if not camera then return end
+
+    if savedCameraType == nil then
+        savedCameraType = camera.CameraType
+    end
+
+    -- Chỉ lưu subject thật của player; tuyệt đối không lưu Ball làm subject gốc.
+    local currentSubject = camera.CameraSubject
+    if currentSubject and currentSubject ~= ballSubject then
+        if savedCameraSubject == nil then
+            savedCameraSubject = currentSubject
+        end
+    end
+end
+
+local function cameraToBall(ball)
+    if not ball then return end
+    camera = workspace.CurrentCamera
+    if not camera then return end
+    saveCamera(ball)
+    camera.CameraType = Enum.CameraType.Custom
+    camera.CameraSubject = ball
+end
+
+local function restoreCamera()
+    camera = workspace.CurrentCamera
+    if not camera then return end
+    updateCharacter()
+    camera.CameraType = savedCameraType or Enum.CameraType.Custom
+    if humanoid then
+        camera.CameraSubject = humanoid
+    elseif savedCameraSubject then
+        camera.CameraSubject = savedCameraSubject
+    end
+    savedCameraType, savedCameraSubject = nil, nil
 end
 
 --========================================================--
--- MODE 1
+-- HIGHLIGHT / SAE PASS
 --========================================================--
+
+local targetHighlight
+
+local function clearTarget()
+    selectedTarget = nil
+    saePassActive = false
+    if targetHighlight then
+        targetHighlight:Destroy()
+        targetHighlight = nil
+    end
+end
+
+local function highlightTarget(plr)
+    if targetHighlight then targetHighlight:Destroy() end
+    selectedTarget = plr
+    saePassActive = plr ~= nil
+
+    if not plr or not plr.Character then return end
+
+    targetHighlight = Instance.new("Highlight")
+    targetHighlight.Name = "SaePassTarget"
+    targetHighlight.FillTransparency = 0.45
+    targetHighlight.OutlineTransparency = 0
+    targetHighlight.Adornee = plr.Character
+    targetHighlight.Parent = plr.Character
+    notify("SAE PASS TARGET", plr.Name, 1.8)
+end
+
+local function getClosestTeammateToMouse()
+    camera = workspace.CurrentCamera
+    if not camera then return nil end
+
+    local mousePos = UserInputService:GetMouseLocation()
+    local viewport = camera.ViewportSize
+    local center = Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
+    local best, bestDistance = nil, math.huge
+
+    -- User asked for target nearest to mouse, while following camera aim.
+    -- This uses screen-space mouse distance and only teammates.
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and sameTeam(plr) and plr.Character then
+            local hrp = getPlayerRoot(plr)
+            if hrp then
+                local point, onScreen = camera:WorldToViewportPoint(hrp.Position)
+                if onScreen and point.Z > 0 then
+                    local d = (Vector2.new(point.X, point.Y) - mousePos).Magnitude
+                    if d < bestDistance then
+                        bestDistance = d
+                        best = plr
+                    end
+                end
+            end
+        end
+    end
+
+    -- Fallback: nearest screen target around camera center.
+    if not best then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= player and sameTeam(plr) and plr.Character then
+                local hrp = getPlayerRoot(plr)
+                if hrp then
+                    local point, onScreen = camera:WorldToViewportPoint(hrp.Position)
+                    if onScreen and point.Z > 0 then
+                        local d = (Vector2.new(point.X, point.Y) - center).Magnitude
+                        if d < bestDistance then
+                            bestDistance = d
+                            best = plr
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function tryNetworkOwner(ball)
+    if not ball or not ball:IsA("BasePart") then return nil end
+    local ok, owner = pcall(function()
+        return ball:GetNetworkOwner()
+    end)
+    if ok then return owner end
+    return nil
+end
+
+local function updateOwnershipNotification(ball)
+    if not ball then return end
+    local owner = tryNetworkOwner(ball)
+    if owner == player and lastOwnershipState ~= true then
+        lastOwnershipState = true
+        notify("PHYSICS CONTROL", "Ball network ownership = YOU", 2)
+    elseif owner ~= player and owner ~= nil and lastOwnershipState ~= false then
+        lastOwnershipState = false
+        notify("PHYSICS CONTROL", "Ball network ownership changed", 1.4)
+    end
+end
+
+--========================================================--
+-- CONTROL / BALL KINEMATICS
+--========================================================--
+
+local function getFlatCameraDirections()
+    camera = workspace.CurrentCamera
+    if not camera then return Vector3.zAxis, Vector3.xAxis end
+
+    local forward = Vector3.new(camera.CFrame.LookVector.X, 0, camera.CFrame.LookVector.Z)
+    local right = Vector3.new(camera.CFrame.RightVector.X, 0, camera.CFrame.RightVector.Z)
+
+    if forward.Magnitude > 0 then forward = forward.Unit end
+    if right.Magnitude > 0 then right = right.Unit end
+    return forward, right
+end
+
+local function getCameraDirection()
+    camera = workspace.CurrentCamera
+    if not camera then return Vector3.zAxis end
+    local dir = camera.CFrame.LookVector
+    if dir.Magnitude > 0 then dir = dir.Unit end
+    return dir
+end
 
 local function controlMode1(ball)
+    local forward, right = getFlatCameraDirections()
+    local direction = Vector3.zero
 
-	local forward, right =
-		getFlatDirections()
+    if keys.W then direction += forward end
+    if keys.S then direction -= forward end
+    if keys.D then direction += right end
+    if keys.A then direction -= right end
 
-	local direction =
-		Vector3.zero
+    local velocity = ball.AssemblyLinearVelocity
+    local horizontal = Vector3.zero
+    if direction.Magnitude > 0 then
+        horizontal = direction.Unit * modeSettings[1].speed
+    end
 
-	if keys.W then
-		direction += forward
-	end
+    local vertical = velocity.Y
+    if keys.E then
+        vertical = modeSettings[1].speed
+    elseif keys.Q then
+        vertical = -modeSettings[1].speed
+    end
 
-	if keys.S then
-		direction -= forward
-	end
-
-	if keys.D then
-		direction += right
-	end
-
-	if keys.A then
-		direction -= right
-	end
-
-	local velocity =
-		ball.AssemblyLinearVelocity
-
-	local horizontal =
-		Vector3.zero
-
-	if direction.Magnitude > 0 then
-
-		horizontal =
-			direction.Unit
-			* speed
-	end
-
-	local vertical =
-		velocity.Y
-
-	if keys.E then
-
-		vertical =
-			speed
-
-	elseif keys.Q then
-
-		vertical =
-			-speed
-
-	end
-
-	ball.AssemblyLinearVelocity =
-		Vector3.new(
-			horizontal.X,
-			vertical,
-			horizontal.Z
-		)
+    ball.AssemblyLinearVelocity = Vector3.new(horizontal.X, vertical, horizontal.Z)
 end
-
---========================================================--
--- MODE 2
---========================================================--
 
 local function controlMode2(ball)
+    -- Mode 2: camera direction, không phụ thuộc trục X/Z cố định.
+    local dir = getCameraDirection()
+    ball.AssemblyLinearVelocity = dir * modeSettings[2].speed
+end
 
-	if
-		camera.CameraSubject
-		~= ball
-	then
+local function makeCurvedVelocity(ball)
+    camera = workspace.CurrentCamera
+    local origin = ball.Position
+    local direction = getCameraDirection()
+    local height = modeSettings[3].height
+    local curve = modeSettings[3].curve
+    local speed = modeSettings[3].speed
 
-		cameraToBall(ball)
-	end
+    -- Điểm rơi nằm phía trước theo hướng camera. Height được dựng thẳng lên tại vị trí sút,
+    -- không lấy height theo chiều camera.
+    local horizontalDir = Vector3.new(direction.X, 0, direction.Z)
+    if horizontalDir.Magnitude < 0.001 then
+        horizontalDir = Vector3.new(0,0,-1)
+    else
+        horizontalDir = horizontalDir.Unit
+    end
 
-	local direction =
-		camera.CFrame.LookVector
+    local range = math.max(1, speed * 1.15)
+    local target = origin + horizontalDir * range
+    target += Vector3.new(0, height, 0)
 
-	if direction.Magnitude > 0 then
+    local toTarget = target - origin
+    local distance = toTarget.Magnitude
+    local base = toTarget.Unit * speed
 
-		direction =
-			direction.Unit
-	end
+    -- Curve tạo thành phần ngang vuông góc với hướng camera + một thành phần rơi/chống rơi.
+    local side = Vector3.new(-horizontalDir.Z, 0, horizontalDir.X)
+    local curveVector = side * curve
+    return base + curveVector
+end
 
-	ball.AssemblyLinearVelocity =
-		direction
-		* speed
+local function performMode3Kick(ball)
+    if not ball then return end
+    local velocity = makeCurvedVelocity(ball)
+    ball.AssemblyLinearVelocity = velocity
+    notify("MODE 3", string.format("Height %.1f / Curve %.1f", modeSettings[3].height, modeSettings[3].curve), 1.8)
+end
+
+local function performMode4Kick(ball)
+    if not ball then return end
+    local direction = getCameraDirection()
+    ball.AssemblyLinearVelocity = direction * modeSettings[4].speed
+    -- Không có loop điều chỉnh sau cú này.
+    notify("RONALDO MODE", "Velocity sent — no follow-up control", 1.8)
+end
+
+local function performControlAction()
+    local state, holder, ball = getBallState()
+    if not ball then
+        notify("CONTROL", "Không tìm thấy bóng", 1.4)
+        return
+    end
+
+    if mode == 1 then
+        enabled = true
+        applyModeLock()
+        notify("CONTROL", "Mode 1 active", 1.2)
+    elseif mode == 2 then
+        enabled = true
+        applyModeLock()
+        cameraToBall(ball)
+        notify("CONTROL", "Mode 2 active", 1.2)
+    elseif mode == 3 then
+        if localHasBall() then
+            performMode3Kick(ball)
+        else
+            notify("MODE 3", "Cần đang cầm bóng", 1.4)
+        end
+    elseif mode == 4 then
+        if localHasBall() then
+            performMode4Kick(ball)
+        else
+            notify("MODE 4", "Cần đang cầm bóng", 1.4)
+        end
+    end
 end
 
 --========================================================--
--- BALL LOOP
+-- STEAL BALL
 --========================================================--
 
-RunService.Heartbeat:Connect(
-	function()
+local function stealBallStep()
+    if not stealBallEnabled then return end
+    if not updateCharacter() or not rootPart then return end
+    if localHasBall() then return end
 
-		local ball =
-			findBall()
+    local state, holder, ball = getBallState()
+    if state == "MISSING" then return end
 
-		if ball then
+    local targetRoot
+    if holder and holder ~= player and not sameTeam(holder) then
+        targetRoot = getPlayerRoot(holder)
+    elseif not holder and ball then
+        targetRoot = ball
+    end
 
-			ballStatus.Text =
-				"BALL: FOUND"
-
-			ballStatus.TextColor3 =
-				Color3.fromRGB(
-					100,
-					255,
-					130
-				)
-
-		else
-
-			ballStatus.Text =
-				"BALL: NOT FOUND"
-
-			ballStatus.TextColor3 =
-				Color3.fromRGB(
-					255,
-					100,
-					100
-				)
-		end
-
-		if not enabled then
-			return
-		end
-
-		if not ball then
-			return
-		end
-
-		if mode == 1 then
-
-			controlMode1(
-				ball
-			)
-
-		elseif mode == 2 then
-
-			controlMode2(
-				ball
-			)
-		end
-	end
-)
+    if targetRoot then
+        local destination = targetRoot.Position + Vector3.new(0, DEFAULT_STEAL_DISTANCE, 0)
+        rootPart.CFrame = CFrame.new(destination)
+        stealCooldown = 0
+    end
+end
 
 --========================================================--
--- CHARACTER RESPAWN
+-- SAE PASS
 --========================================================--
 
-player.CharacterAdded:Connect(
-	function()
+local function executeSaePass()
+    if not saePassEnabled then return end
+    if not selectedTarget or not getPlayerRoot(selectedTarget) then
+        clearTarget()
+        notify("SAE PASS", "Không còn target hợp lệ", 1.4)
+        return
+    end
 
-		task.wait(0.5)
+    local state, holder, ball = getBallState()
+    if not ball then return end
 
-		-- Character mới
-		updateCharacter()
+    -- Chỉ thực hiện cú Sae Pass khi local player thực sự đang giữ bóng.
+    -- Đây chính là trường hợp holder == player; không được return ở đây.
+    if holder ~= player then
+        notify("SAE PASS", "Bạn phải đang cầm bóng để thực hiện Sae Pass", 1.4)
+        return
+    end
 
-		-- Không mang state lock cũ sang character mới
-		playerIsLocked = false
+    local targetRoot = getPlayerRoot(selectedTarget)
+    if not targetRoot then
+        clearTarget()
+        return
+    end
 
-		savedWalkSpeed = nil
-		savedJumpPower = nil
-		savedAutoRotate = nil
+    local startPosition = ball.Position
+    saePassActive = true
 
-		if enabled then
+    -- Giai đoạn 1: bóng đi thẳng đứng lên đúng ~300 studs tại vị trí sút.
+    ball.CFrame = CFrame.new(startPosition + Vector3.new(0, SAE_PASS_HEIGHT, 0))
+    ball.AssemblyLinearVelocity = Vector3.zero
 
-			if autoLock
-				or manualLock
-			then
+    notify("SAE PASS", "Ball launched upward → " .. selectedTarget.Name, 1.5)
 
-				lockPlayer()
+    -- Giai đoạn 2: sau khi lên cao, chuyển bóng tới đúng phía trên đầu target
+    -- rồi để hệ thống Sae Pass tiếp tục điều khiển nó lao xuống target.
+    task.delay(0.12, function()
+        if not saePassActive or not selectedTarget or not ball or not ball.Parent then
+            return
+        end
 
-			else
+        local currentTargetRoot = getPlayerRoot(selectedTarget)
+        if not currentTargetRoot then
+            clearTarget()
+            return
+        end
 
-				forceUnlock()
+        local targetAbove = currentTargetRoot.Position + Vector3.new(0, SAE_PASS_HEIGHT, 0)
+        ball.CFrame = CFrame.new(targetAbove)
 
-			end
+        local desired = currentTargetRoot.Position + Vector3.new(0, 2.5, 0)
+        local delta = desired - ball.Position
+        if delta.Magnitude > 0 then
+            ball.AssemblyLinearVelocity = delta.Unit * SAE_PASS_SPEED
+        else
+            ball.AssemblyLinearVelocity = Vector3.zero
+        end
+    end)
+end
 
-			if mode == 2 then
+local function handleControlKeyPressed()
+    local now = os.clock()
+    if now - lastControlPress < 0.08 then return end
+    lastControlPress = now
 
-				local ball =
-					findBall()
+    if changingControlKey then return end
 
-				if ball then
-					cameraToBall(ball)
-				end
-			end
+    if saePassEnabled and leftMouseHeld then
+        if not selectedTarget then
+            local target = getClosestTeammateToMouse()
+            if target then
+                highlightTarget(target)
+            else
+                notify("SAE PASS", "Không tìm thấy đồng đội", 1.4)
+            end
+        else
+            executeSaePass()
+        end
+        return
+    end
 
-		else
-
-			forceUnlock()
-
-		end
-
-		updateUI()
-	end
-)
+    performControlAction()
+end
 
 --========================================================--
--- CHARACTER REFERENCE SAFETY
+-- BUTTON EVENTS
 --========================================================--
 
-RunService.Heartbeat:Connect(
-	function()
+controlButton.MouseButton1Click:Connect(function()
+    changingControlKey = true
+    controlButton.Text = "PRESS A KEY..."
+    notify("CONTROL KEY", "Nhấn một phím mới (ESC = hủy)", 1.8)
+end)
 
-		if
-			character
-			~= player.Character
-		then
+modeButton.MouseButton1Click:Connect(function()
+    mode += 1
+    if mode > 4 then mode = 1 end
 
-			updateCharacter()
+    if mode == 3 or mode == 4 then
+        -- Hai mode kick không cần anchor.
+        if rootPart then rootPart.Anchored = false end
+        unlockPlayer()
+    end
 
-			-- Nếu character đổi mà
-			-- script đang không lock,
-			-- đảm bảo không mang reference cũ
-			if not enabled then
+    if enabled and mode == 2 then
+        local ball = findBall()
+        if ball then cameraToBall(ball) end
+    elseif mode ~= 2 then
+        restoreCamera()
+    end
 
-				playerIsLocked =
-					false
+    applyModeLock()
+    updateUI()
+    notify("MODE", modeName(), 1.5)
+end)
 
-				savedWalkSpeed =
-					nil
+anchorButton.MouseButton1Click:Connect(function()
+    anchorEnabled = not anchorEnabled
+    if anchorEnabled then
+        notify("ANCHOR", "Enabled — only Mode 1/2", 1.5)
+    else
+        notify("ANCHOR", "Disabled", 1.5)
+    end
+    applyModeLock()
+    updateUI()
+end)
 
-				savedJumpPower =
-					nil
+forceUnanchorButton.MouseButton1Click:Connect(function()
+    forceUnanchor()
+    updateUI()
+end)
 
-				savedAutoRotate =
-					nil
-			end
-		end
-	end
-)
+stealButton.MouseButton1Click:Connect(function()
+    stealBallEnabled = not stealBallEnabled
+    notify("STEAL BALL", stealBallEnabled and "ON" or "OFF", 1.5)
+    updateUI()
+end)
+
+saeButton.MouseButton1Click:Connect(function()
+    saePassEnabled = not saePassEnabled
+    if not saePassEnabled then clearTarget() end
+    notify("SAE PASS", saePassEnabled and "ON" or "OFF", 1.5)
+    updateUI()
+end)
+
+lockButton.MouseButton1Click:Connect(function()
+    if playerWasLocked then
+        forceUnanchor()
+    else
+        applyModeLock()
+    end
+    updateUI()
+end)
+
+--========================================================--
+-- INPUT
+--========================================================--
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        leftMouseHeld = true
+        return
+    end
+
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    if changingControlKey then
+        if input.KeyCode == Enum.KeyCode.Escape then
+            changingControlKey = false
+            updateUI()
+            return
+        end
+        if input.KeyCode ~= Enum.KeyCode.Unknown then
+            controlKey = input.KeyCode
+            changingControlKey = false
+            updateUI()
+            notify("CONTROL KEY", "Set to " .. controlKey.Name, 1.6)
+        end
+        return
+    end
+
+    -- Control key là ACTION key, không phải toggle enabled.
+    if input.KeyCode == controlKey then
+        handleControlKeyPressed()
+        return
+    end
+
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.W then keys.W = true end
+    if input.KeyCode == Enum.KeyCode.A then keys.A = true end
+    if input.KeyCode == Enum.KeyCode.S then keys.S = true end
+    if input.KeyCode == Enum.KeyCode.D then keys.D = true end
+    if input.KeyCode == Enum.KeyCode.Q then keys.Q = true end
+    if input.KeyCode == Enum.KeyCode.E then keys.E = true end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        leftMouseHeld = false
+        return
+    end
+
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if input.KeyCode == Enum.KeyCode.W then keys.W = false end
+    if input.KeyCode == Enum.KeyCode.A then keys.A = false end
+    if input.KeyCode == Enum.KeyCode.S then keys.S = false end
+    if input.KeyCode == Enum.KeyCode.D then keys.D = false end
+    if input.KeyCode == Enum.KeyCode.Q then keys.Q = false end
+    if input.KeyCode == Enum.KeyCode.E then keys.E = false end
+end)
+
+--========================================================--
+-- HEARTBEAT
+--========================================================--
+
+RunService.Heartbeat:Connect(function(dt)
+    updateCharacter()
+
+    local state, holder, ball = getBallState()
+
+    if state == "HELD" then
+        ballStatus.Text = "BALL: HELD — " .. holder.Name
+        if holder == player then
+            ballStatus.TextColor3 = Color3.fromRGB(100,255,255)
+        elseif sameTeam(holder) then
+            ballStatus.TextColor3 = Color3.fromRGB(100,255,130)
+        else
+            ballStatus.TextColor3 = Color3.fromRGB(255,100,100)
+        end
+    elseif state == "FREE" then
+        ballStatus.Text = "BALL: FREE"
+        ballStatus.TextColor3 = Color3.fromRGB(255,215,100)
+    else
+        ballStatus.Text = "BALL: NOT FOUND"
+        ballStatus.TextColor3 = Color3.fromRGB(255,100,100)
+    end
+
+    updateOwnershipNotification(ball)
+
+    if holder ~= lastHolder then
+        if holder == player and lastHolder ~= player then
+            notify("BALL CONTROL", "Ball is now yours", 2)
+        elseif lastHolder == player and holder ~= player then
+            if selectedTarget == nil then
+                notify("BALL CONTROL", "Ball left local player", 1.5)
+            end
+        end
+        lastHolder = holder
+    end
+
+    if stealBallEnabled then
+        stealCooldown += dt
+        if stealCooldown >= 0.025 then
+            stealBallStep()
+            stealCooldown = 0
+        end
+    end
+
+    -- Mode 1/2 are continuous control modes only while explicitly active.
+    if enabled and ball then
+        if mode == 1 then
+            controlMode1(ball)
+        elseif mode == 2 then
+            controlMode2(ball)
+        end
+    end
+
+    -- Sae Pass: bóng bay cao trước, sau đó hướng xuống target.
+    if saePassActive and selectedTarget and ball then
+        local targetRoot = getPlayerRoot(selectedTarget)
+        if targetRoot and not localHasBall() then
+            local desired = targetRoot.Position + Vector3.new(0, 2.5, 0)
+            local delta = desired - ball.Position
+            if delta.Magnitude > 6 then
+                ball.AssemblyLinearVelocity = delta.Unit * SAE_PASS_SPEED
+            else
+                ball.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+    end
+
+    -- Highlight tắt nếu người khác nhận bóng hoặc target không còn hợp lệ.
+    if saePassActive then
+        if not selectedTarget or not selectedTarget.Parent then
+            clearTarget()
+        elseif holder and holder ~= player and holder == selectedTarget then
+            clearTarget()
+            notify("SAE PASS", "Target received the ball", 1.5)
+        elseif holder and holder ~= player and holder ~= selectedTarget then
+            clearTarget()
+            notify("SAE PASS", "Another player received the ball", 1.5)
+        end
+    end
+
+    if mode == 1 or mode == 2 then
+        applyModeLock()
+    else
+        if rootPart and rootPart.Anchored then rootPart.Anchored = false end
+    end
+end)
+
+--========================================================--
+-- RESPAWN
+--========================================================--
+
+player.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    updateCharacter()
+    playerWasLocked = false
+    savedWalkSpeed, savedJumpPower, savedAutoRotate = nil, nil, nil
+    clearTarget()
+
+    if enabled and (mode == 1 or mode == 2) and anchorEnabled then
+        applyModeLock()
+    else
+        if rootPart then rootPart.Anchored = false end
+        unlockPlayer()
+    end
+
+    updateUI()
+end)
 
 --========================================================--
 -- INITIALIZE
 --========================================================--
 
-updateCharacter()
+refreshSettingsPanel()
 updateUI()
-
-print(
-	"[Ball Controller] Lock system rebuilt - no Anchored lock."
-)
+notify("BALL CONTROLLER", "V3 loaded", 1.8)
+print("[Ball Controller V3] loaded")
