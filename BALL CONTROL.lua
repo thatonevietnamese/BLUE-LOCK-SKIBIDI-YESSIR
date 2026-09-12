@@ -1,6 +1,6 @@
 --========================================================--
 --                 BALL CONTROLLER V3                     --
---  Modes 1-5 / Steal Ball / Sae Pass / Ball Status UI   --
+--  Modes 2 & 4 / Steal Ball / Sae Pass / Ball Status UI   --
 --========================================================--
 
 local Players = game:GetService("Players")
@@ -8,6 +8,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -25,17 +26,21 @@ local DEFAULT_STEAL_DISTANCE = 3
 local SAE_PASS_HEIGHT = 300
 local SAE_PASS_SPEED = 260
 local DEFAULT_TP_TIME = 1.5
-local MODE5_RELEASE_TIME = 0.12
-local MODE3_MIN_DURATION = 0.35
-local MODE3_MAX_DURATION = 4
-local ENDPOINT_RAY_DISTANCE = 1000
+local STEAL_SLIDE_INTERVAL = 0.12
+local STEAL_SLIDE_DISTANCE = 12
+local STEAL_TARGET_SCAN_INTERVAL = 0.08
+local STEAL_UNSAFE_ATTRIBUTE_NAMES = {"Invincible","Ragdoll","Dancing","Cutscene","Stunned","Dangai","IchigoCounter"}
+local STEAL_UNSAFE_ANIMATION_WORDS = {"counter","awakening","special","ultimate","skill","parry","block"}
+local GK_ROLE_NAMES = {"gk", "goalkeeper", "goal keeper", "keeper"}
+local GK_TP_OFFSET = Vector3.new(0, 2.5, 0)
+local GK_DIVE_DELAY = 0.30
+local GK_GOAL_RADIUS = 18
+local GK_DIVE_COOLDOWN = 1.0
+local GK_SPECIAL_DURATION = 0.35
 
 local modeSettings = {
     [1] = { speed = 60 },
-    [2] = { speed = 60 },
-    [3] = { speed = 60, curve = 30, angle = 0 },
-    [4] = { speed = 140 },
-    [5] = { speed = 140, height = 180 },
+    [2] = { speed = 140 },
 }
 
 --========================================================--
@@ -68,30 +73,20 @@ local State = {
     lastHolder = nil,
     lastOwnershipState = nil,
     stealCooldown = 0,
+    stealSlideCooldown = 0,
+    stealScanCooldown = 0,
+    stealLastTarget = nil,
 
-    mode3Active = false,
-    mode3Ball = nil,
-    mode3Start = nil,
-    mode3Control = nil,
-    mode3End = nil,
-    mode3EndSelected = false,
-    mode3StartTime = 0,
-    mode3Duration = 1,
-
-    mode5Stage = "IDLE",
-    mode5Ball = nil,
-    mode5TopY = nil,
-    mode5RiseSpeed = 0,
-    mode5ReleaseStarted = 0,
-    mode5End = nil,
-    mode5EndSelected = false,
+    gkSpecialEnabled = false,
+    gkLastGoalPart = nil,
+    gkDiveReadyAt = 0,
+    gkSpecialReturnAt = 0,
 
     tpDuration = DEFAULT_TP_TIME,
     tpActive = false,
     tpStartedAt = 0,
     tpReturnCFrame = nil,
-
-    keys = {W=false,A=false,S=false,D=false,Q=false,E=false},
+    tpGoalActive = false,
 }
 
 -- NOTIFICATIONS
@@ -217,7 +212,7 @@ local function applyModeLock()
         unlockPlayer()
         return
     end
-    if State.enabled and State.anchorEnabled and (State.mode == 1 or State.mode == 2) then
+    if State.enabled and State.anchorEnabled and State.mode == 1 then
         savePlayerState()
         humanoid.WalkSpeed = 0
         humanoid.JumpPower = 0
@@ -453,22 +448,25 @@ local statusLabel = makeLabel(main,"Status: READY",10,42,320,22,13)
 local ballStatus = makeLabel(main,"BALL: SEARCHING...",10,64,320,22,12)
 
 local controlButton = makeButton(main,"CONTROL KEY: F",10,92,160,36)
-local modeButton = makeButton(main,"MODE: 1",180,92,160,36)
+local modeButton = makeButton(main,"MODE: 1 [CAMERA]",180,92,160,36)
 local anchorButton = makeButton(main,"ANCHOR: ON",10,136,160,36)
 local forceUnanchorButton = makeButton(main,"FORCE UNANCHOR",180,136,160,36)
 local stealButton = makeButton(main,"STEAL BALL: OFF",10,180,160,36)
 local saeButton = makeButton(main,"SAE PASS: OFF",180,180,160,36)
 local settingsButton = makeButton(main,"⚙ SETTINGS",10,224,160,36)
 local statusButton = makeButton(main,"BALL STATUS: ON",180,224,160,36)
-local tpButton = makeButton(main,"TP RETURN",10,268,230,36)
-local tpTimeBox = makeBox(main,State.tpDuration,250,268,90,36)
+local tpButton = makeButton(main,"TP RETURN",10,268,150,36)
+local tpGoalButton = makeButton(main,"TP GOAL",170,268,170,36)
+local tpTimeBox = makeBox(main,State.tpDuration,250,310,90,36)
 
 local info = makeLabel(main,
-    "F = action / toggle theo State.mode.\n"..
-    "Mode 1/2: WASDEQ khi control active.\n"..
-    "Mode 3/5: giữ chuột trái + bấm chuột phải để chọn END.\n"..
-    "Sae Pass: RMB + F để chọn; LMB + F để hủy.",
-    10,315,330,90,11)
+    "F = action theo mode.\n"..
+    "Mode 1: bật/tắt control; bóng chạy theo camera.\n"..
+    "Mode 2: F để sút một lần theo camera.\n"..
+    "SAE Pass Mode 1 = rise + chase; Mode 2 = direct hold.\n"..
+    "GK: TP RETURN → GoalArea + Q dive → tự bám người cầm bóng.\n"..
+    "Barou: Steal Ball không quan tâm đồng đội.",
+    10,350,330,70,11)
 info.TextWrapped = true
 info.TextYAlignment = Enum.TextYAlignment.Top
 info.TextColor3 = Color3.fromRGB(145,145,155)
@@ -585,9 +583,9 @@ settingsTitle.Font = Enum.Font.GothamBold
 local closeSettings = makeButton(settingsFrame,"X",480,8,28,28)
 
 local tabs = {}
-local tabNames = {"MODE 1","MODE 2","MODE 3","MODE 4","MODE 5"}
+local tabNames = {"GENERAL","MODE 1","MODE 2"}
 for i,name in ipairs(tabNames) do
-    tabs[i] = makeButton(settingsFrame,name,10+(i-1)*78,48,72,30)
+    tabs[i] = makeButton(settingsFrame,name,10+(i-1)*110,48,104,30)
 end
 
 local settingsContent = Instance.new("Frame")
@@ -596,79 +594,132 @@ settingsContent.Position = UDim2.fromOffset(10,88)
 settingsContent.BackgroundTransparency = 1
 settingsContent.Parent = settingsFrame
 
-local speedLabels,speedBoxes = {},{}
-for i=1,5 do
-    speedLabels[i] = makeLabel(settingsContent,"SPEED",10,10,110,25,12)
-    speedBoxes[i] = makeBox(settingsContent,modeSettings[i].speed,120,6,220,32)
-    speedLabels[i].Visible = false
-    speedBoxes[i].Visible = false
-end
+-- GENERAL TAB
+local generalTitle = makeLabel(settingsContent,"GENERAL SETTINGS",10,8,220,24,13)
+generalTitle.Font = Enum.Font.GothamBold
+local generalControlLabel = makeLabel(settingsContent,"CONTROL KEY",10,38,110,25,12)
+local generalControlButton = makeButton(settingsContent,"F",120,34,120,32)
+local generalAnchorLabel = makeLabel(settingsContent,"ANCHOR",10,78,110,25,12)
+local generalAnchorButton = makeButton(settingsContent,"ON",120,74,120,32)
+local generalAutoStealLabel = makeLabel(settingsContent,"AUTO STEAL OFF",10,118,110,25,12)
+local generalAutoStealButton = makeButton(settingsContent,"ON",120,114,120,32)
+local generalTPLabel = makeLabel(settingsContent,"TP RETURN TIME",10,158,110,25,12)
+local generalTPBox = makeBox(settingsContent,State.tpDuration,120,154,120,32)
+local generalHint = makeLabel(settingsContent,"General: các thiết lập dùng chung. Nếu Role = GK, TP RETURN sẽ về GoalArea của đội và tự mô phỏng Q (dive). CharacterName = Barou sẽ cho phép Steal Ball đuổi cả đồng đội.",10,205,440,55,11)
+generalHint.TextWrapped=true
+generalHint.TextColor3=Color3.fromRGB(145,145,155)
 
-local curveLabel = makeLabel(settingsContent,"CURVE",10,56,100,25,12)
-local curveBox = makeBox(settingsContent,modeSettings[3].curve,120,52,220,32)
-local angleLabel = makeLabel(settingsContent,"ANGLE",10,102,100,25,12)
-local angleBox = makeBox(settingsContent,modeSettings[3].angle,120,98,220,32)
-local mode5HeightLabel = makeLabel(settingsContent,"HEIGHT / FORCE",10,56,110,25,12)
-local mode5HeightBox = makeBox(settingsContent,modeSettings[5].height,120,52,220,32)
-local settingsHint = makeLabel(settingsContent,"",10,160,440,80,11)
-settingsHint.TextWrapped = true
-settingsHint.TextColor3 = Color3.fromRGB(145,145,155)
+local mode1Label = makeLabel(settingsContent,"SPEED",10,10,110,25,12)
+local mode1Box = makeBox(settingsContent,modeSettings[1].speed,120,6,220,32)
+local mode1Hint = makeLabel(settingsContent,"Mode 1: bóng chạy liên tục theo hướng camera khi control đang ACTIVE.",10,70,440,80,11)
+mode1Hint.TextWrapped=true
+mode1Hint.TextColor3=Color3.fromRGB(145,145,155)
 
-curveLabel.Visible=false
-curveBox.Visible=false
-angleLabel.Visible=false
-angleBox.Visible=false
-mode5HeightLabel.Visible=false
-mode5HeightBox.Visible=false
+local mode2Label = makeLabel(settingsContent,"SPEED",10,10,110,25,12)
+local mode2Box = makeBox(settingsContent,modeSettings[2].speed,120,6,220,32)
+local mode2Hint = makeLabel(settingsContent,"Mode 2: dùng Events.ShootBall một lần; script không loop ép velocity sau cú sút.",10,70,440,80,11)
+mode2Hint.TextWrapped=true
+mode2Hint.TextColor3=Color3.fromRGB(145,145,155)
+
 local selectedSettingsTab = 1
 
 local function parseSetting(box,oldValue,minValue,maxValue)
     local n = tonumber(box.Text)
     if not n then box.Text=tostring(oldValue); return oldValue end
-    n = math.clamp(n,minValue,maxValue)
+    n=math.clamp(n,minValue,maxValue)
     box.Text=tostring(n)
     return n
 end
 
-local function refreshSettingsPanel()
-    for i=1,5 do
-        speedLabels[i].Visible = selectedSettingsTab == i
-        speedBoxes[i].Visible = selectedSettingsTab == i
-    end
-    local m3 = selectedSettingsTab == 3
-    local m5 = selectedSettingsTab == 5
-    curveLabel.Visible=m3; curveBox.Visible=m3
-    angleLabel.Visible=m3; angleBox.Visible=m3
-    mode5HeightLabel.Visible=m5; mode5HeightBox.Visible=m5
-    if selectedSettingsTab==1 then
-        settingsHint.Text="Mode 1: WASDEQ điều khiển liên tục; khi không Q/E, Y của bóng được giữ ổn định."
-    elseif selectedSettingsTab==2 then
-        settingsHint.Text="Mode 2: bóng chạy theo hướng camera khi control active."
-    elseif selectedSettingsTab==3 then
-        settingsHint.Text="Mode 3: giữ chuột trái + bấm chuột phải để chọn END. CURVE điều chỉnh độ cong của cung tròn; ANGLE xoay mặt phẳng 2D của cung trong thế giới 3D. Bấm F để bay tới END."
-    elseif selectedSettingsTab==4 then
-        settingsHint.Text="Mode 4: giữ nguyên cơ chế hiện tại — truyền velocity một lần và không loop chỉnh bóng."
-    elseif selectedSettingsTab==5 then
-        settingsHint.Text="Mode 5: F lần 1 release ngắn → bay thẳng lên HEIGHT/FORCE → treo; chọn END rồi F để phóng theo SPEED."
-    end
+local function setGeneralControls()
+    generalControlButton.Text=State.controlKey.Name
+    generalAnchorButton.Text=State.anchorEnabled and "ON" or "OFF"
+    generalAutoStealButton.Text=State.autoStealOffOnGet and "ON" or "OFF"
+    generalTPBox.Text=tostring(State.tpDuration)
 end
-for i=1,5 do
+
+local function refreshSettingsPanel()
+    local general=selectedSettingsTab==1
+    local mode1=selectedSettingsTab==2
+    local mode2=selectedSettingsTab==3
+
+    generalTitle.Visible=general
+    generalControlLabel.Visible=general
+    generalControlButton.Visible=general
+    generalAnchorLabel.Visible=general
+    generalAnchorButton.Visible=general
+    generalAutoStealLabel.Visible=general
+    generalAutoStealButton.Visible=general
+    generalTPLabel.Visible=general
+    generalTPBox.Visible=general
+    generalHint.Visible=general
+
+    mode1Label.Visible=mode1
+    mode1Box.Visible=mode1
+    mode1Hint.Visible=mode1
+    mode2Label.Visible=mode2
+    mode2Box.Visible=mode2
+    mode2Hint.Visible=mode2
+
+    setGeneralControls()
+end
+
+for i=1,3 do
     tabs[i].MouseButton1Click:Connect(function()
         selectedSettingsTab=i
         refreshSettingsPanel()
     end)
-    if i <= 5 then
-        speedBoxes[i].FocusLost:Connect(function()
-            modeSettings[i].speed=parseSetting(speedBoxes[i],modeSettings[i].speed,MIN_SPEED,MAX_SPEED)
-        end)
-    end
 end
 
-curveBox.FocusLost:Connect(function() modeSettings[3].curve=parseSetting(curveBox,modeSettings[3].curve,-1000,1000) end)
-angleBox.FocusLost:Connect(function() modeSettings[3].angle=parseSetting(angleBox,modeSettings[3].angle,-180,180) end)
-mode5HeightBox.FocusLost:Connect(function() modeSettings[5].height=parseSetting(mode5HeightBox,modeSettings[5].height,MIN_SPEED,MAX_SPEED) end)
+generalControlButton.MouseButton1Click:Connect(function()
+    State.changingControlKey=true
+    generalControlButton.Text="PRESS KEY"
+    notify("CONTROL KEY","Nhấn phím mới (ESC = hủy)",1.6)
+end)
 
---========================================================--
+generalAnchorButton.MouseButton1Click:Connect(function()
+    State.anchorEnabled=not State.anchorEnabled
+    State.forceUnanchorActive=false
+    anchorButton.Text=State.anchorEnabled and "ANCHOR: ON" or "ANCHOR: OFF"
+    if State.anchorEnabled and State.enabled and State.mode==1 then
+        applyModeLock()
+    else
+        unlockPlayer()
+        if rootPart then rootPart.Anchored=false end
+    end
+    setGeneralControls()
+end)
+
+generalAutoStealButton.MouseButton1Click:Connect(function()
+    State.autoStealOffOnGet=not State.autoStealOffOnGet
+    setGeneralControls()
+    notify("AUTO STEAL",State.autoStealOffOnGet and "OFF ON GET: ON" or "OFF ON GET: OFF",1.1)
+end)
+
+generalTPBox.FocusLost:Connect(function()
+    local value=tonumber(generalTPBox.Text)
+    if not value then generalTPBox.Text=tostring(State.tpDuration); return end
+    State.tpDuration=math.clamp(value,0.1,60)
+    generalTPBox.Text=tostring(State.tpDuration)
+    tpTimeBox.Text=tostring(State.tpDuration)
+end)
+
+mode1Box.FocusLost:Connect(function()
+    modeSettings[1].speed=parseSetting(mode1Box,modeSettings[1].speed,MIN_SPEED,MAX_SPEED)
+end)
+
+mode2Box.FocusLost:Connect(function()
+    modeSettings[2].speed=parseSetting(mode2Box,modeSettings[2].speed,MIN_SPEED,MAX_SPEED)
+end)
+
+tpTimeBox.FocusLost:Connect(function()
+    local value=tonumber(tpTimeBox.Text)
+    if not value then tpTimeBox.Text=tostring(State.tpDuration); return end
+    State.tpDuration=math.clamp(value,0.1,60)
+    tpTimeBox.Text=tostring(State.tpDuration)
+    generalTPBox.Text=tostring(State.tpDuration)
+end)
+
 -- DRAG MAIN / SETTINGS
 --========================================================--
 
@@ -757,462 +808,36 @@ local function getCameraDirection()
 end
 
 --========================================================--
--- MODE 1 / 2
+-- MODE 1
 --========================================================--
 
 local function controlMode1(ball)
-    local forward,right=getFlatCameraDirections()
-    local direction=Vector3.zero
-    if State.keys.W then direction+=forward end
-    if State.keys.S then direction-=forward end
-    if State.keys.D then direction+=right end
-    if State.keys.A then direction-=right end
-    local horizontal=Vector3.zero
-    if direction.Magnitude>0 then horizontal=direction.Unit*modeSettings[1].speed end
-    local vertical=0
-    if State.keys.E then vertical=modeSettings[1].speed elseif State.keys.Q then vertical=-modeSettings[1].speed end
-    ball.AssemblyLinearVelocity=Vector3.new(horizontal.X,vertical,horizontal.Z)
-end
-
-local function controlMode2(ball)
+    if not ball then return end
     local dir=getCameraDirection()
-    ball.AssemblyLinearVelocity=dir*modeSettings[2].speed
+    ball.AssemblyLinearVelocity=dir*math.clamp(modeSettings[1].speed,MIN_SPEED,MAX_SPEED)
 end
 
---========================================================--
--- ENDPOINT PICKER
--- Hold LMB + press RMB to select the 3D point under mouse.
---========================================================--
-
-local endpointMarker
-local selectedEndPoint = nil
-
-local function getMouseWorldPoint()
-    camera=workspace.CurrentCamera
-    if not camera then return nil end
-    local mouse=UserInputService:GetMouseLocation()
-    local ray=camera:ViewportPointToRay(mouse.X,mouse.Y)
-    local params=RaycastParams.new()
-    params.FilterType=Enum.RaycastFilterType.Exclude
-    local ignore={}
-    if player.Character then table.insert(ignore,player.Character) end
-    if State.mode3Ball then table.insert(ignore,State.mode3Ball) end
-    if State.mode5Ball then table.insert(ignore,State.mode5Ball) end
-    params.FilterDescendantsInstances=ignore
-    local result=workspace:Raycast(ray.Origin,ray.Direction*ENDPOINT_RAY_DISTANCE,params)
-    if result then return result.Position end
-    return ray.Origin+ray.Direction*math.min(300,ENDPOINT_RAY_DISTANCE)
-end
-
-local function showEndpoint(point)
-    selectedEndPoint=point
-    if not endpointMarker then
-        endpointMarker=Instance.new("Part")
-        endpointMarker.Name="BallController_EndPoint"
-        endpointMarker.Shape=Enum.PartType.Ball
-        endpointMarker.Size=Vector3.new(1.4,1.4,1.4)
-        endpointMarker.Material=Enum.Material.Neon
-        endpointMarker.Color=Color3.fromRGB(255,210,70)
-        endpointMarker.Anchored=true
-        endpointMarker.CanCollide=false
-        endpointMarker.CanTouch=false
-        endpointMarker.CanQuery=false
-        endpointMarker.Transparency=0.1
-        endpointMarker.Parent=workspace
-    end
-    endpointMarker.Position=point+Vector3.new(0,0.7,0)
-    endpointMarker.Transparency=0.1
-    notify("END POINT",string.format("%.1f, %.1f, %.1f",point.X,point.Y,point.Z),1.1)
-end
-
-local function clearEndpoint()
-    selectedEndPoint=nil
-    State.mode3EndSelected=false
-    State.mode5End=nil
-    State.mode5EndSelected=false
-    if endpointMarker then
-        endpointMarker.Transparency=1
-    end
-end
-
-local function pickEndpoint()
-    local point=getMouseWorldPoint()
-    if not point then
-        notify("END POINT","Không lấy được vị trí chuột",1.1)
-        return false
-    end
-    showEndpoint(point)
-    if State.mode==3 then
-        State.mode3End=point
-        State.mode3EndSelected=true
-    elseif State.mode==5 and State.mode5Stage=="WAITING" then
-        State.mode5End=point
-        State.mode5EndSelected=true
-    end
-    return true
-end
-
---========================================================--
--- MODE 3: REAL CURVED PATH
---========================================================--
-
-local function bezier2(a,b,c,t)
-    local u=1-t
-    return a*(u*u)+b*(2*u*t)+c*(t*t)
-end
-
-local function bezierTangent(a,b,c,t)
-    return (b-a)*(2*(1-t))+(c-b)*(2*t)
-end
-
-local function getMode3ArcData(startPos,endPos,curve,angleDeg)
-    local chord=endPos-startPos
-    local distance=chord.Magnitude
-    if distance<0.001 then return nil end
-
-    local forward=chord.Unit
-
-    -- Base perpendicular vector: prefer world-up projected onto the
-    -- plane perpendicular to Start -> End. If the chord is vertical,
-    -- use a horizontal reference instead.
-    local up=Vector3.new(0,1,0)
-    local planeUp=up-forward*up:Dot(forward)
-    if planeUp.Magnitude<0.001 then
-        local ref=Vector3.new(1,0,0)
-        planeUp=ref-forward*ref:Dot(forward)
-    end
-    planeUp=planeUp.Unit
-
-    -- ANGLE rotates the 2D flight plane around the Start -> End axis.
-    local angle=math.rad(angleDeg or 0)
-    local side=forward:Cross(planeUp)
-    if side.Magnitude<0.001 then
-        side=Vector3.new(0,0,1)
-    else
-        side=side.Unit
-    end
-
-    local arcNormal=planeUp*math.cos(angle)+side*math.sin(angle)
-    if arcNormal.Magnitude<0.001 then
-        arcNormal=planeUp
-    else
-        arcNormal=arcNormal.Unit
-    end
-
-    -- The circular arc lives in the plane spanned by forward + arcNormal.
-    -- CURVE is the signed sagitta (maximum distance from the chord).
-    local sag=tonumber(curve) or 0
-    if math.abs(sag)<0.001 then
-        return {
-            straight=true,
-            startPos=startPos,
-            endPos=endPos,
-            distance=distance,
-        }
-    end
-
-    local maxSag=math.max(0.05,distance*0.49)
-    sag=math.clamp(sag,-maxSag,maxSag)
-
-    local absSag=math.abs(sag)
-    local signSag=sag>=0 and 1 or -1
-
-    -- Radius from chord length + sagitta:
-    -- R = d^2/(8h) + h/2
-    local radius=(distance*distance)/(8*absSag)+(absSag*0.5)
-    local halfChord=distance*0.5
-    local centerOffset=radius-absSag
-
-    local midpoint=startPos+chord*0.5
-    local center=midpoint-arcNormal*(centerOffset*signSag)
-
-    local startRadius=startPos-center
-    local endRadius=endPos-center
-    local r=radius
-
-    -- Build the rotation direction in the 2D arc plane.
-    local radialStart=startRadius.Unit
-    local radialEnd=endRadius.Unit
-    local cross3=radialStart:Cross(radialEnd)
-    local theta=math.acos(math.clamp(radialStart:Dot(radialEnd),-1,1))
-
-    -- Choose the shorter arc. For our clamped sag this is the intended arc.
-    local rotationAxis=forward:Cross(arcNormal)
-    if rotationAxis.Magnitude<0.001 then
-        rotationAxis=Vector3.new(0,1,0)
-    else
-        rotationAxis=rotationAxis.Unit
-    end
-    if cross3:Dot(rotationAxis)<0 then
-        theta=-theta
-    end
-
-    return {
-        straight=false,
-        startPos=startPos,
-        endPos=endPos,
-        center=center,
-        radius=r,
-        radialStart=radialStart,
-        rotationAxis=rotationAxis,
-        theta=theta,
-        distance=distance,
-    }
-end
-
-local function pointOnMode3Arc(data,t)
-    t=math.clamp(t,0,1)
-
-    if data.straight then
-        return data.startPos:Lerp(data.endPos,t)
-    end
-
-    local rotation=CFrame.fromAxisAngle(data.rotationAxis,data.theta*t)
-    local radial=rotation:VectorToWorldSpace(data.radialStart)
-    return data.center+radial*data.radius
-end
-
-local function tangentOnMode3Arc(data,t)
-    t=math.clamp(t,0,1)
-
-    if data.straight then
-        local d=data.endPos-data.startPos
-        return d.Magnitude>0.001 and d.Unit or Vector3.zero
-    end
-
-    local rotation=CFrame.fromAxisAngle(data.rotationAxis,data.theta*t)
-    local radial=rotation:VectorToWorldSpace(data.radialStart)
-    local tangent=data.rotationAxis:Cross(radial)
-
-    if data.theta<0 then tangent=-tangent end
-    return tangent.Magnitude>0.001 and tangent.Unit or Vector3.zero
-end
-
-local function startMode3(ball)
-    if not ball or not localHasBall() then
-        notify("MODE 3","Cần đang cầm bóng",1.3)
-        return
-    end
-
-    if not State.mode3EndSelected or not State.mode3End then
-        notify("MODE 3","Giữ chuột trái + bấm chuột phải để chọn END",1.5)
-        return
-    end
-
-    local speed=math.clamp(modeSettings[3].speed,MIN_SPEED,MAX_SPEED)
-    local startPos=ball.Position
-    local endPos=State.mode3End
-    local distance=(endPos-startPos).Magnitude
-
-    if distance<1 then
-        notify("MODE 3","END quá gần",1.1)
-        return
-    end
-
-    local arc=getMode3ArcData(
-        startPos,
-        endPos,
-        modeSettings[3].curve,
-        modeSettings[3].angle
-    )
-
-    if not arc then
-        notify("MODE 3","Không tạo được quỹ đạo",1.2)
-        return
-    end
-
-    State.mode3Start=startPos
-    State.mode3Control=arc
-    State.mode3End=endPos
-    State.mode3Ball=ball
-    State.mode3StartTime=os.clock()
-    State.mode3Duration=math.clamp(distance/speed,MODE3_MIN_DURATION,MODE3_MAX_DURATION)
-    State.mode3Active=true
-
-    fireShootRemote((endPos-startPos).Unit,math.min(speed,MAX_SPEED),false)
-
-    notify(
-        "MODE 3",
-        string.format(
-            "ARC → END | CURVE %.1f | ANGLE %.1f°",
-            modeSettings[3].curve,
-            modeSettings[3].angle
-        ),
-        1.6
-    )
-end
-
-local function updateMode3()
-    if not State.mode3Active then return end
-
-    local ball=State.mode3Ball
-    local arc=State.mode3Control
-
-    if not ball or not ball.Parent or not arc then
-        State.mode3Active=false
-        return
-    end
-
-    local t=math.clamp(
-        (os.clock()-State.mode3StartTime)/State.mode3Duration,
-        0,
-        1
-    )
-
-    local pos=pointOnMode3Arc(arc,t)
-    local tangent=tangentOnMode3Arc(arc,t)
-
-    if tangent.Magnitude>0 then
-        ball.CFrame=CFrame.lookAt(pos,pos+tangent)
-        ball.AssemblyLinearVelocity=tangent*math.max(modeSettings[3].speed,MIN_SPEED)
-    else
-        ball.CFrame=CFrame.new(pos)
-        ball.AssemblyLinearVelocity=Vector3.zero
-    end
-
-    if t>=1 then
-        ball.CFrame=CFrame.lookAt(State.mode3End,State.mode3End+tangent)
-        ball.AssemblyLinearVelocity=tangent*math.max(modeSettings[3].speed,MIN_SPEED)
-        State.mode3Active=false
-        State.mode3Ball=nil
-        State.mode3Control=nil
-        clearEndpoint()
-    end
-end
-
---========================================================--
--- MODE 4 (UNCHANGED WORKING BEHAVIOR)
+-- MODE 2 (RONALDO / OLD MODE 4 BEHAVIOR)
 --========================================================--
 
 local function performMode4Kick(ball)
     if not ball then return end
     local direction=getCameraDirection()
-    local force=math.clamp(modeSettings[4].speed,MIN_SPEED,MAX_SPEED)
-    ball.AssemblyLinearVelocity=direction*force
-    notify("RONALDO MODE",string.format("Velocity %.1f",force),1.3)
-end
+    local force=math.clamp(modeSettings[2].speed,MIN_SPEED,MAX_SPEED)
 
---========================================================--
--- MODE 5
---========================================================--
-
-local function resetMode5()
-    State.mode5Stage="IDLE"
-    State.mode5Ball=nil
-    State.mode5TopY=nil
-    State.mode5RiseSpeed=0
-    State.mode5ReleaseStarted=0
-    State.mode5End=nil
-    State.mode5EndSelected=false
-    State.mode5TravelStarted=0
-end
-
-local function startMode5(ball)
-    if not ball or not localHasBall() then
-        notify("MODE 5","Cần đang cầm bóng",1.3)
-        return
+    -- Mode 2 must let the game's ShootBall remote perform the release.
+    -- Directly forcing AssemblyLinearVelocity here can leave a held/welded
+    -- ball visually attached to the player instead of being released.
+    if fireShootRemote(direction,force,false) then
+        notify("RONALDO MODE","ShootBall velocity sent",1.4)
     end
-    local force=math.clamp(modeSettings[5].height,MIN_SPEED,MAX_SPEED)
-    local forward,_=getFlatCameraDirections()
-    local releaseSpeed=math.max(force*0.35,15)
-
-    fireShootRemote(forward,releaseSpeed,false)
-
-    State.mode5Stage="RELEASING"
-    State.mode5Ball=ball
-    State.mode5RiseSpeed=force
-    State.mode5ReleaseStarted=os.clock()
-    notify("MODE 5",string.format("Release → UP %.1f",force),1.3)
-end
-
-local function updateMode5()
-    if State.mode5Stage=="IDLE" then return end
-    local ball=State.mode5Ball
-    if not ball or not ball.Parent then resetMode5(); return end
-
-    if State.mode5Stage=="RELEASING" then
-        if os.clock()-State.mode5ReleaseStarted<MODE5_RELEASE_TIME then
-            local forward,_=getFlatCameraDirections()
-            ball.AssemblyLinearVelocity=forward*math.max(State.mode5RiseSpeed*0.25,10)
-            return
-        end
-        State.mode5TopY=ball.Position.Y+State.mode5RiseSpeed
-        State.mode5Stage="RISING"
-    end
-
-    if State.mode5Stage=="RISING" then
-        if ball.Position.Y<State.mode5TopY then
-            ball.AssemblyLinearVelocity=Vector3.new(0,State.mode5RiseSpeed,0)
-            return
-        end
-        ball.CFrame=CFrame.new(ball.Position.X,State.mode5TopY,ball.Position.Z)
-        ball.AssemblyLinearVelocity=Vector3.zero
-        State.mode5Stage="WAITING"
-        notify("MODE 5",string.format("READY %.1f → F để launch",modeSettings[5].height),1.5)
-        return
-    end
-
-    if State.mode5Stage=="WAITING" then
-        ball.CFrame=CFrame.new(ball.Position.X,State.mode5TopY,ball.Position.Z)
-        ball.AssemblyLinearVelocity=Vector3.zero
-        return
-    end
-
-    if State.mode5Stage=="TRAVEL" then
-        local endPos=State.mode5End
-        if not endPos then resetMode5(); return end
-        local delta=endPos-ball.Position
-        local distance=delta.Magnitude
-        if distance<=1.5 then
-            ball.CFrame=CFrame.new(endPos)
-            ball.AssemblyLinearVelocity=Vector3.zero
-            notify("MODE 5","Đã tới END",1.1)
-            resetMode5()
-            selectedEndPoint=nil
-            return
-        end
-        local speed=math.clamp(modeSettings[5].speed,MIN_SPEED,MAX_SPEED)
-        ball.CFrame=CFrame.new(ball.Position,ball.Position+delta.Unit)
-        ball.AssemblyLinearVelocity=delta.Unit*speed
-    end
-end
-
-local function launchMode5()
-    if State.mode5Stage~="WAITING" then return end
-    if not State.mode5EndSelected or not State.mode5End then
-        notify("MODE 5","Giữ chuột trái + bấm chuột phải để chọn END",1.5)
-        return
-    end
-    local ball=State.mode5Ball
-    if not ball or not ball.Parent then resetMode5(); return end
-    local delta=State.mode5End-ball.Position
-    if delta.Magnitude<1 then
-        notify("MODE 5","END quá gần",1.1)
-        return
-    end
-    State.mode5Stage="TRAVEL"
-    State.mode5TravelStarted=os.clock()
-    ball.AssemblyLinearVelocity=delta.Unit*math.clamp(modeSettings[5].speed,MIN_SPEED,MAX_SPEED)
-    notify("MODE 5",string.format("CONTROL → END | SPEED %.1f",math.clamp(modeSettings[5].speed,MIN_SPEED,MAX_SPEED)),1.4)
-    if endpointMarker then endpointMarker.Transparency=1 end
-    selectedEndPoint=nil
-end
-
-local function performMode5Action(ball)
-    if State.mode5Stage=="WAITING" then launchMode5(); return end
-    if State.mode5Stage=="RISING" or State.mode5Stage=="RELEASING" then
-        notify("MODE 5","Ball đang bay lên",0.8)
-        return
-    end
-    startMode5(ball)
 end
 
 --========================================================--
 -- SAE PASS
--- RMB + F: select target / start pass. LMB + F: cancel.
--- Mode 1: short rise then travel toward target.
--- Mode 2: direct instant teleport of ball to target, then hold there
--- until target actually receives the ball.
+-- Hold LMB + F = select target.
+-- Release LMB = launch to selected target.
+-- Press F again while target is selected = launch immediately.
 --========================================================--
 
 local targetHighlight
@@ -1260,43 +885,65 @@ local function getClosestTeammateToMouse()
 end
 
 local function startSaePass(ball,target)
-    if not ball or not target then return end
+    if not ball or not target then return false end
+    if not localHasBall() then
+        clearTarget()
+        notify("SAE PASS","Cần đang cầm bóng",1.2)
+        return false
+    end
+
     local targetRoot=getPlayerRoot(target)
-    if not targetRoot then return end
+    if not targetRoot then return false end
 
     State.saePassActive=true
     State.saePassBall=ball
     State.saePassTarget=target
-    State.saePassPassSpeed=math.clamp(modeSettings[3].speed,MIN_SPEED,MAX_SPEED)
+    State.saePassPassSpeed=math.clamp(
+        (State.mode==1 and modeSettings[1].speed or modeSettings[2].speed),
+        MIN_SPEED,
+        MAX_SPEED
+    )
     State.saePassStartTime=os.clock()
 
     if State.mode==2 then
-        -- Mode 2: instant move to the target and keep the ball there until received.
+        -- SAE PASS MODE 2: direct move/hold at the receiver until they actually receive it.
         State.saePassStage="DIRECT"
         ball.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,2.5,0))
         ball.AssemblyLinearVelocity=Vector3.zero
-        notify("SAE PASS","DIRECT → "..target.Name,1.4)
-        return
+        notify("SAE PASS","MODE 2 DIRECT → "..target.Name,1.3)
+    else
+        -- SAE PASS MODE 1: rise first, then continuously steer toward the moving receiver.
+        State.saePassStage="RISING"
+        local riseForce=math.clamp(SAE_PASS_SPEED*0.32,MIN_SPEED,MAX_SPEED)
+        fireShootRemote(Vector3.new(0,1,0),riseForce,false)
+        State.saePassTopY=ball.Position.Y+math.min(SAE_PASS_HEIGHT,90)
+        notify("SAE PASS","MODE 1 RISING → "..target.Name,1.3)
     end
 
-    -- Mode 1: short rise, then curve/steer toward target.
-    State.saePassStage="RISING"
-    local force=math.clamp(SAE_PASS_SPEED*0.32,MIN_SPEED,MAX_SPEED)
-    fireShootRemote(Vector3.new(0,1,0),force,false)
-    State.saePassTopY=ball.Position.Y+math.min(SAE_PASS_HEIGHT,90)
-    notify("SAE PASS","RISING → "..target.Name,1.4)
+    if targetHighlight then targetHighlight.FillTransparency=0.85 end
+    return true
 end
 
 local function updateSaePass()
     if not State.saePassActive then return end
     local ball=State.saePassBall
     local target=State.saePassTarget
-    if not ball or not ball.Parent or not target or not target.Parent then clearTarget(); return end
+    if not ball or not ball.Parent or not target or not target.Parent then
+        clearTarget()
+        return
+    end
+
     local targetRoot=getPlayerRoot(target)
-    if not targetRoot then clearTarget(); return end
+    if not targetRoot then
+        clearTarget()
+        return
+    end
+
+    -- IMPORTANT: do not clear merely because localHasBall() is still true on the
+    -- first frames. The server may release the ball a few frames after the remote.
+    -- We keep the pass state alive until the target actually receives it.
 
     if State.saePassStage=="DIRECT" then
-        -- Do not release the ball until the target actually receives it.
         if not localHasBall() then
             ball.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,2.5,0))
             ball.AssemblyLinearVelocity=Vector3.zero
@@ -1317,7 +964,6 @@ local function updateSaePass()
         local delta=targetPos-ball.Position
         local distance=delta.Magnitude
         if distance<=10 then
-            -- Within 10 studs: slow down and fly toward the player instead of teleporting.
             local slowSpeed=math.clamp(distance*4,20,State.saePassPassSpeed)
             ball.AssemblyLinearVelocity=(distance>0.05 and delta.Unit or Vector3.zero)*slowSpeed
         else
@@ -1326,47 +972,354 @@ local function updateSaePass()
     end
 end
 
-local function handleSaeInput()
-    if not State.saePassEnabled then return false end
-    if State.rightMouseHeld then
-        local state,holder,ball=getBallState()
-        if holder~=player then
-            notify("SAE PASS","Cần đang cầm bóng",1.2)
+local function selectSaePassTarget()
+    local state,holder=getBallState()
+    if holder~=player or state~="HELD" then
+        notify("SAE PASS","Cần đang cầm bóng",1.2)
+        return false
+    end
+
+    local target=getClosestTeammateToMouse()
+    if not target then
+        notify("SAE PASS","Không tìm thấy đồng đội",1.3)
+        return false
+    end
+
+    highlightTarget(target)
+    return true
+end
+
+local function launchSelectedSaePass()
+    if not State.selectedTarget then
+        notify("SAE PASS","Giữ chuột trái + F để chọn target",1.3)
+        return false
+    end
+
+    local _,_,ball=getBallState()
+    if not ball then
+        clearTarget()
+        notify("SAE PASS","Không tìm thấy bóng",1.2)
+        return false
+    end
+
+    return startSaePass(ball,State.selectedTarget)
+end
+
+--========================================================--
+-- GK HELPERS
+--========================================================--
+
+local function getCharacterNameValue()
+    local values=player:FindFirstChild("Values")
+    local valueObj=values and values:FindFirstChild("CharacterName")
+    if valueObj and valueObj.Value ~= nil then
+        return tostring(valueObj.Value)
+    end
+    return ""
+end
+
+local function localIsBarou()
+    return string.lower(getCharacterNameValue()) == "barou"
+end
+
+local function getRoleName()
+    local roleObj=player:FindFirstChild("Role")
+    if roleObj and roleObj.Value ~= nil then
+        return string.lower(tostring(roleObj.Value))
+    end
+
+    local values=player:FindFirstChild("Values")
+    local valuesRole=values and values:FindFirstChild("Role")
+    if valuesRole and valuesRole.Value ~= nil then
+        return string.lower(tostring(valuesRole.Value))
+    end
+
+    if character then
+        local charRole=character:FindFirstChild("Role")
+        if charRole and charRole.Value ~= nil then
+            return string.lower(tostring(charRole.Value))
+        end
+    end
+
+    return ""
+end
+
+local function localIsGoalkeeper()
+    local role=string.gsub(getRoleName(),"%s+"," ")
+    for _,name in ipairs(GK_ROLE_NAMES) do
+        if role == name then
             return true
         end
-        if not State.selectedTarget then
-            local target=getClosestTeammateToMouse()
-            if target then
-                highlightTarget(target)
-                notify("SAE PASS","F để bắt đầu pass → "..target.Name,1.5)
-            else
-                notify("SAE PASS","Không tìm thấy đồng đội",1.3)
-            end
-        else
-            startSaePass(ball,State.selectedTarget)
-        end
-        return true
-    end
-    if State.leftMouseHeld then
-        clearTarget()
-        notify("SAE PASS","Cancelled",1.1)
-        return true
     end
     return false
 end
 
+local function getTeamIsHome()
+    return player.Team and string.lower(player.Team.Name)=="home"
+end
+
+local function resolveGoalHitboxForTeam(homeSide)
+    local map=workspace:FindFirstChild("Map")
+    if not map then return nil end
+
+    local goalName=homeSide and "PlayerOneGoal" or "PlayerTwoGoal"
+    local goalModel=map:FindFirstChild(goalName)
+    if not goalModel then return nil end
+
+    local score=goalModel:FindFirstChild("ScoreHitbox") or goalModel:FindFirstChild("Score")
+    if score and score:IsA("BasePart") then
+        return score
+    end
+
+    local hitbox=goalModel:FindFirstChild("ScoreHitbox",true)
+    if hitbox and hitbox:IsA("BasePart") then
+        return hitbox
+    end
+
+    local firstPart=goalModel:FindFirstChildWhichIsA("BasePart",true)
+    return firstPart
+end
+
+local function resolveGoalAreaForTeam(homeSide)
+    local goalName=homeSide and "PlayerOneGoalArea" or "PlayerTwoGoalArea"
+    local goal=workspace:FindFirstChild(goalName)
+    if not goal then return nil end
+    if goal:IsA("BasePart") then return goal end
+    if goal:IsA("Model") then
+        if goal.PrimaryPart then return goal.PrimaryPart end
+        return goal:FindFirstChildWhichIsA("BasePart",true)
+    end
+    return nil
+end
+
+local function resolveOwnGoalPart()
+    local isHome=getTeamIsHome()
+    return resolveGoalAreaForTeam(isHome) or resolveGoalHitboxForTeam(isHome)
+end
+
+local function resolveOpponentGoalHitbox()
+    local isHome=getTeamIsHome()
+    return resolveGoalHitboxForTeam(not isHome)
+end
+
+local function sendVirtualKey(keyCode)
+    if not VirtualInputManager then return false end
+    return pcall(function()
+        VirtualInputManager:SendKeyEvent(true,keyCode,false,game)
+        task.wait()
+        VirtualInputManager:SendKeyEvent(false,keyCode,false,game)
+    end)
+end
+
+local function isInsideGoalArea(position, goalPart)
+    if not position or not goalPart then return false end
+    return (position-goalPart.Position).Magnitude <= GK_GOAL_RADIUS
+end
+
+local function getCurrentBallTarget()
+    local state,holder,ball=getBallState()
+
+    if state=="HELD" and holder and holder~=player then
+        local targetRoot=getPlayerRoot(holder)
+        if targetRoot then
+            return targetRoot,holder
+        end
+    end
+
+    if state=="FREE" and ball and ball.Parent then
+        return ball,nil
+    end
+
+    return nil,nil
+end
+
+local function getGKDiveCooldownRemaining()
+    return math.max(0, (State.gkDiveReadyAt or 0)-os.clock())
+end
+
+local function performGKTPReturn()
+    if not localIsGoalkeeper() or not updateCharacter() or not rootPart then
+        return false
+    end
+
+    local goalPart=resolveOwnGoalPart()
+    if not goalPart then
+        notify("GK RETURN","Không tìm thấy GoalArea của đội",1.5)
+        return false
+    end
+
+    -- GK flow is intentionally independent from Steal Ball/target safety checks.
+    -- Only the dive cooldown is respected.
+    local cooldown=getGKDiveCooldownRemaining()
+    if cooldown>0 then
+        notify("GK RETURN",string.format("Dive đang hồi %.1fs",cooldown),1.0)
+        return false
+    end
+
+    State.gkLastGoalPart=goalPart
+    State.gkSpecialEnabled=true
+
+    -- Nếu đang ngoài khu GK thì đưa vào trước. Nếu đã ở trong thì giữ nguyên vị trí.
+    if not isInsideGoalArea(rootPart.Position,goalPart) then
+        rootPart.CFrame=CFrame.new(goalPart.Position+GK_TP_OFFSET)
+        task.wait(GK_DIVE_DELAY)
+    else
+        task.wait(GK_DIVE_DELAY)
+    end
+
+    -- Chỉ giả lập Q, không kiểm tra target/dạng skill/ragdoll của đối thủ.
+    sendVirtualKey(Enum.KeyCode.Q)
+    State.gkDiveReadyAt=os.clock()+GK_DIVE_COOLDOWN
+    State.gkSpecialReturnAt=os.clock()+GK_SPECIAL_DURATION
+
+    -- Sau Q: nếu có người giữ bóng thì TP tới người đó.
+    -- Nếu bóng đang free thì TP trực tiếp tới bóng. Không phụ thuộc team.
+    local targetRoot,holder=getCurrentBallTarget()
+    if targetRoot then
+        if holder then
+            rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
+            notify("GK RETURN","Q DIVE → TP → "..holder.Name,1.4)
+        else
+            rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
+            notify("GK RETURN","Q DIVE → TP → FREE BALL",1.4)
+        end
+    else
+        notify("GK RETURN","Q DIVE → chưa tìm thấy bóng",1.3)
+    end
+
+    return true
+end
+
 --========================================================--
--- STEAL BALL
+-- STEAL BALL / AUTO SLIDE
 --========================================================--
 
-local function stealBallStep()
-    if not State.stealBallEnabled or not updateCharacter() or not rootPart or localHasBall() then return end
+local function getBoolAttributeOrChild(model,name)
+    if not model then return false end
+    local ok,value=pcall(function() return model:GetAttribute(name) end)
+    if ok and value==true then return true end
+    return model:FindFirstChild(name) ~= nil
+end
+
+local function hasUnsafeAnimation(targetCharacter)
+    local targetHumanoid=targetCharacter and targetCharacter:FindFirstChildOfClass("Humanoid")
+    if not targetHumanoid then return false end
+    local animator=targetHumanoid:FindFirstChildOfClass("Animator")
+    if not animator then return false end
+
+    for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local name=string.lower(tostring(track.Name or ""))
+        if track.Animation then
+            name=name.." "..string.lower(tostring(track.Animation.Name or ""))
+        end
+        for _,word in ipairs(STEAL_UNSAFE_ANIMATION_WORDS) do
+            if string.find(name,word,1,true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function targetLooksUnsafe(plr)
+    if not plr or plr==player or not plr.Character then return true end
+    local char=plr.Character
+    for _,name in ipairs(STEAL_UNSAFE_ATTRIBUTE_NAMES) do
+        if getBoolAttributeOrChild(char,name) then return true end
+    end
+    return hasUnsafeAnimation(char)
+end
+
+local function localSlideLooksUnsafe()
+    if not character then return true end
+    for _,name in ipairs({"Ragdoll","Dancing","Cutscene","Stunned"}) do
+        if getBoolAttributeOrChild(character,name) then return true end
+    end
+    return false
+end
+
+local function sendVirtualE()
+    if not VirtualInputManager then return false end
+    return pcall(function()
+        VirtualInputManager:SendKeyEvent(true,Enum.KeyCode.E,false,game)
+        VirtualInputManager:SendKeyEvent(false,Enum.KeyCode.E,false,game)
+    end)
+end
+
+local function findStealTarget()
     local state,holder,ball=getBallState()
-    if state=="MISSING" then return end
-    local targetRoot
-    if holder and holder~=player and not sameTeam(holder) then targetRoot=getPlayerRoot(holder)
-    elseif not holder and ball then targetRoot=ball end
-    if targetRoot then rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0)) end
+    if state=="HELD" and holder and holder~=player then
+        -- Barou: ignore team ownership and still chase / spam E.
+        -- Normal characters: only chase an opposing holder.
+        local allowed=localIsBarou() or not sameTeam(holder)
+        if allowed then
+            if targetLooksUnsafe(holder) then return nil,nil end
+            return holder,getPlayerRoot(holder)
+        end
+    end
+    if state=="FREE" and ball then
+        return nil,ball
+    end
+    return nil,nil
+end
+
+local function stealBallStep(dt)
+    if not State.stealBallEnabled or not updateCharacter() or not rootPart or localHasBall() then return end
+    if localSlideLooksUnsafe() then return end
+
+    State.stealSlideCooldown += dt
+    State.stealScanCooldown += dt
+
+    local target,targetRoot
+    if State.stealLastTarget and State.stealScanCooldown < STEAL_TARGET_SCAN_INTERVAL then
+        target=State.stealLastTarget
+        if targetLooksUnsafe(target) then
+            target=nil
+        else
+            targetRoot=getPlayerRoot(target)
+        end
+    end
+
+    if State.stealScanCooldown >= STEAL_TARGET_SCAN_INTERVAL or not targetRoot then
+        State.stealScanCooldown=0
+        target,targetRoot=findStealTarget()
+        State.stealLastTarget=target
+    end
+
+    if not targetRoot then return end
+
+    rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
+
+    if State.stealSlideCooldown >= STEAL_SLIDE_INTERVAL then
+        State.stealSlideCooldown=0
+        local distance=(targetRoot.Position-rootPart.Position).Magnitude
+        if distance <= STEAL_SLIDE_DISTANCE and (not target or not targetLooksUnsafe(target)) then
+            sendVirtualE()
+        end
+    end
+end
+
+--========================================================--
+-- TP GOAL
+-- Home -> PlayerTwoGoal.ScoreHitbox
+-- Away -> PlayerOneGoal.ScoreHitbox
+--========================================================--
+
+local function startTPGoal()
+    if not updateCharacter() or not rootPart then
+        notify("TP GOAL","Không tìm thấy nhân vật",1.2)
+        return
+    end
+
+    local goalPart=resolveOpponentGoalHitbox()
+    if not goalPart then
+        notify("TP GOAL","Không tìm thấy ScoreHitbox đối diện",1.3)
+        return
+    end
+
+    rootPart.CFrame=CFrame.new(goalPart.Position+GK_TP_OFFSET)
+    State.tpGoalActive=true
+    notify("TP GOAL",getTeamIsHome() and "HOME → PLAYER TWO GOAL" or "AWAY → PLAYER ONE GOAL",1.3)
 end
 
 --========================================================--
@@ -1378,28 +1331,59 @@ local function restoreTemporaryTP(reason)
     local saved=State.tpReturnCFrame
     State.tpActive=false
     State.tpReturnCFrame=nil
+    State.tpGoalActive=false
+    State.gkSpecialEnabled=false
+    State.gkSpecialReturnAt=0
+    State.gkLastGoalPart=nil
     if saved and updateCharacter() and rootPart then rootPart.CFrame=saved end
     if reason then notify("TP RETURN",reason,1.2) end
 end
 
 local function startTemporaryTP()
-    if State.tpActive then restoreTemporaryTP("Returned"); return end
-    if not updateCharacter() or not rootPart then notify("TP RETURN","Không tìm thấy nhân vật",1.2); return end
+    if State.tpActive then
+        State.gkSpecialEnabled=false
+        State.gkLastGoalPart=nil
+        restoreTemporaryTP("Returned")
+        return
+    end
+    if not updateCharacter() or not rootPart then
+        notify("TP RETURN","Không tìm thấy nhân vật",1.2)
+        return
+    end
+
+    -- GK: ONLY run the dedicated GK flow. Do not merge with Steal Ball / E / target filtering.
+    if localIsGoalkeeper() then
+        local savedBeforeGK=rootPart.CFrame
+        if performGKTPReturn() then
+            State.tpReturnCFrame=savedBeforeGK
+            State.tpActive=true
+            State.tpStartedAt=os.clock()
+            return
+        end
+        return
+    end
 
     local state,holder,ball=getBallState()
     local targetPosition,targetName
 
-    if state=="HELD" and holder and holder~=player and not sameTeam(holder) then
+    if state=="HELD" and holder and holder~=player and (localIsBarou() or not sameTeam(holder)) then
         local targetRoot=getPlayerRoot(holder)
-        if targetRoot then targetPosition=targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0); targetName=holder.Name end
+        if targetRoot then
+            targetPosition=targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0)
+            targetName=holder.Name
+        end
     elseif state=="FREE" and ball then
         targetPosition=ball.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0)
         targetName="FREE BALL"
     end
 
-    if not targetPosition then notify("TP RETURN","Không có bóng hợp lệ để TP",1.3); return end
+    if not targetPosition then
+        notify("TP RETURN","Không có bóng hợp lệ để TP",1.3)
+        return
+    end
 
     State.tpReturnCFrame=rootPart.CFrame
+    State.tpGoalActive=false
     State.tpActive=true
     State.tpStartedAt=os.clock()
     rootPart.CFrame=CFrame.new(targetPosition)
@@ -1411,16 +1395,13 @@ end
 --========================================================--
 
 local function modeName()
-    if State.mode==1 then return "MODE 1 [CAMERA WASDEQ]" end
-    if State.mode==2 then return "MODE 2 [CAMERA]" end
-    if State.mode==3 then return "MODE 3 [CURVED ARC]" end
-    if State.mode==4 then return "MODE 4 [RONALDO]" end
-    return "MODE 5 [SKY WAIT]"
+    if State.mode==1 then return "MODE 1 [CAMERA]" end
+    return "MODE 2 [RONALDO]"
 end
 
 local function updateUI()
     controlButton.Text="CONTROL KEY: "..State.controlKey.Name
-    modeButton.Text=modeName()..(State.mode==5 and State.mode5Stage=="WAITING" and " [READY]" or "")
+    modeButton.Text=modeName()
     statusLabel.Text=State.enabled and "Status: ACTIVE" or "Status: READY"
     statusLabel.TextColor3=State.enabled and Color3.fromRGB(100,255,130) or Color3.fromRGB(255,205,100)
     stealButton.Text=State.stealBallEnabled and "STEAL BALL: ON" or "STEAL BALL: OFF"
@@ -1480,33 +1461,35 @@ controlButton.MouseButton1Click:Connect(function()
 end)
 
 modeButton.MouseButton1Click:Connect(function()
-    State.mode = State.mode + 1
-    if State.mode > 5 then State.mode = 1 end
-    resetMode5()
-    State.mode3Active=false
-    clearEndpoint()
-    if State.mode~=1 and State.mode~=2 then
-        State.enabled=false
-        if rootPart then rootPart.Anchored=false end
-        unlockPlayer()
-        restoreCamera()
+    State.mode=(State.mode==1) and 2 or 1
+    State.enabled=false
+    State.forceUnanchorActive=false
+    if rootPart then rootPart.Anchored=false end
+    unlockPlayer()
+    restoreCamera()
+    if State.mode==1 then
+        local ball=findBall()
+        if ball then cameraToBall(ball) end
     end
-    if State.mode==2 and State.enabled then
-        local ball=findBall(); if ball then cameraToBall(ball) end
-    elseif State.mode~=2 then restoreCamera() end
-    applyModeLock()
     updateUI()
     notify("MODE",modeName(),1.3)
 end)
 
-
 stealButton.MouseButton1Click:Connect(function()
     State.stealBallEnabled = not State.stealBallEnabled
+    if not State.stealBallEnabled then
+        State.stealLastTarget=nil
+        State.stealSlideCooldown=0
+        State.stealScanCooldown=0
+    end
 
     -- Nếu vừa bật nhưng đang cầm bóng và đang chọn AUTO OFF,
     -- tắt ngay thay vì để nút hiển thị ON sai trạng thái.
     if State.stealBallEnabled and State.autoStealOffOnGet and localHasBall() then
         State.stealBallEnabled = false
+        State.stealLastTarget=nil
+        State.stealSlideCooldown=0
+        State.stealScanCooldown=0
         updateUI()
         notify("STEAL BALL", "Tắt ngay — bạn đã có bóng", 1.3)
         return
@@ -1523,13 +1506,8 @@ saeButton.MouseButton1Click:Connect(function()
     notify("SAE PASS",State.saePassEnabled and "ON" or "OFF",1.3)
 end)
 
-tpTimeBox.FocusLost:Connect(function()
-    local value=tonumber(tpTimeBox.Text)
-    if not value then tpTimeBox.Text=tostring(State.tpDuration); return end
-    State.tpDuration=math.clamp(value,0.1,60)
-    tpTimeBox.Text=tostring(State.tpDuration)
-end)
 tpButton.MouseButton1Click:Connect(startTemporaryTP)
+tpGoalButton.MouseButton1Click:Connect(startTPGoal)
 
 --========================================================--
 -- RESTORED LEGACY UI BUTTONS
@@ -1541,7 +1519,7 @@ anchorButton.MouseButton1Click:Connect(function()
     anchorButton.Text = State.anchorEnabled and "ANCHOR: ON" or "ANCHOR: OFF"
     if not State.anchorEnabled then
         unlockPlayer()
-    elseif State.enabled and (State.mode == 1 or State.mode == 2) then
+    elseif State.enabled and State.mode == 1 then
         applyModeLock()
     end
 end)
@@ -1564,25 +1542,29 @@ end)
 --========================================================--
 
 UserInputService.InputBegan:Connect(function(input,gameProcessed)
-    if input.UserInputType==Enum.UserInputType.MouseButton1 then State.leftMouseHeld=true; return end
-    if input.UserInputType==Enum.UserInputType.MouseButton2 then
-        State.rightMouseHeld=true
-        if State.leftMouseHeld and (State.mode==3 or (State.mode==5 and State.mode5Stage=="WAITING")) then
-            pickEndpoint()
-        end
+    if input.UserInputType==Enum.UserInputType.MouseButton1 then
+        State.leftMouseHeld=true
         return
     end
+
+    if input.UserInputType==Enum.UserInputType.MouseButton2 then
+        State.rightMouseHeld=true
+        return
+    end
+
     if input.UserInputType~=Enum.UserInputType.Keyboard then return end
 
     if State.changingControlKey then
         if input.KeyCode==Enum.KeyCode.Escape then
             State.changingControlKey=false
+            setGeneralControls()
             updateUI()
             return
         end
         if input.KeyCode~=Enum.KeyCode.Unknown then
             State.controlKey=input.KeyCode
             State.changingControlKey=false
+            setGeneralControls()
             updateUI()
             notify("CONTROL KEY","Set to "..State.controlKey.Name,1.4)
         end
@@ -1590,71 +1572,62 @@ UserInputService.InputBegan:Connect(function(input,gameProcessed)
     end
 
     if input.KeyCode==State.controlKey then
-        -- Endpoint selection/launch takes priority for Mode 3/5 when both mouse buttons are held.
-        if State.leftMouseHeld and State.rightMouseHeld and (State.mode==3 or (State.mode==5 and State.mode5Stage=="WAITING")) then
-            local _,_,endpointBall=getBallState()
-            if State.mode==3 then
-                startMode3(endpointBall)
+        -- SAE PASS: hold LMB + F to select a teammate; F again can launch immediately.
+        if State.saePassEnabled and State.leftMouseHeld then
+            if not State.selectedTarget then
+                selectSaePassTarget()
             else
-                performMode5Action(endpointBall)
+                launchSelectedSaePass()
             end
             return
         end
 
-        -- Sae Pass owns F only when endpoint selection is not active.
-        if State.saePassEnabled and (State.rightMouseHeld or State.leftMouseHeld) then
-            if handleSaeInput() then return end
+        -- If a target was selected and LMB is no longer held, pressing F launches it.
+        if State.saePassEnabled and State.selectedTarget then
+            launchSelectedSaePass()
+            return
         end
 
-        local state,holder,ball=getBallState()
-        if State.mode==1 or State.mode==2 then
+        local _,_,ball=getBallState()
+
+        if State.mode==1 then
             State.enabled=not State.enabled
             if State.enabled then
                 State.forceUnanchorActive=false
+                if ball then cameraToBall(ball) end
                 applyModeLock()
-                if State.mode==2 and ball then cameraToBall(ball) end
                 notify("CONTROL",modeName().." ACTIVE",1.1)
             else
-                for k in pairs(State.keys) do State.keys[k]=false end
                 restoreCamera()
                 applyModeLock()
                 notify("CONTROL","OFF",1.0)
             end
             updateUI()
             return
-        elseif State.mode==3 then
-            if State.saePassEnabled and State.rightMouseHeld then return end
-            startMode3(ball)
-            return
-        elseif State.mode==4 then
-            if localHasBall() then performMode4Kick(ball) else notify("MODE 4","Cần đang cầm bóng",1.2) end
-            return
-        elseif State.mode==5 then
-            performMode5Action(ball)
-            updateUI()
+        end
+
+        if State.mode==2 then
+            if localHasBall() then
+                performMode4Kick(ball)
+            else
+                notify("MODE 2","Cần đang cầm bóng",1.2)
+            end
             return
         end
     end
 
     if gameProcessed then return end
-    if input.KeyCode==Enum.KeyCode.W then State.keys.W=true end
-    if input.KeyCode==Enum.KeyCode.A then State.keys.A=true end
-    if input.KeyCode==Enum.KeyCode.S then State.keys.S=true end
-    if input.KeyCode==Enum.KeyCode.D then State.keys.D=true end
-    if input.KeyCode==Enum.KeyCode.Q then State.keys.Q=true end
-    if input.KeyCode==Enum.KeyCode.E then State.keys.E=true end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType==Enum.UserInputType.MouseButton1 then State.leftMouseHeld=false; return end
-    if input.UserInputType==Enum.UserInputType.MouseButton2 then State.rightMouseHeld=false; return end
-    if input.UserInputType~=Enum.UserInputType.Keyboard then return end
-    if input.KeyCode==Enum.KeyCode.W then State.keys.W=false end
-    if input.KeyCode==Enum.KeyCode.A then State.keys.A=false end
-    if input.KeyCode==Enum.KeyCode.S then State.keys.S=false end
-    if input.KeyCode==Enum.KeyCode.D then State.keys.D=false end
-    if input.KeyCode==Enum.KeyCode.Q then State.keys.Q=false end
-    if input.KeyCode==Enum.KeyCode.E then State.keys.E=false end
+    if input.UserInputType==Enum.UserInputType.MouseButton1 then
+        State.leftMouseHeld=false
+        if State.saePassEnabled and State.selectedTarget and not State.saePassActive then
+            launchSelectedSaePass()
+        end
+    elseif input.UserInputType==Enum.UserInputType.MouseButton2 then
+        State.rightMouseHeld=false
+    end
 end)
 
 --========================================================--
@@ -1663,62 +1636,46 @@ end)
 
 RunService.Heartbeat:Connect(function(dt)
     updateCharacter()
-    updateMode3()
-    updateMode5()
-    updateSaePass()
 
     local state,holder,ball=getBallState()
     updateBallStatusUI(state,holder,ball)
 
-    -- Auto OFF được kiểm tra độc lập với lastHolder để không phụ thuộc cache.
-    if State.stealBallEnabled and State.autoStealOffOnGet and localHasBall() then
-        State.stealBallEnabled = false
-        notify("STEAL BALL", "Tự động tắt — bạn đã có bóng", 1.4)
+    if State.saePassActive and holder and holder==State.saePassTarget then
+        clearTarget()
+        notify("SAE PASS","Target received the ball",1.2)
+    elseif State.saePassActive and holder and holder~=player and holder~=State.saePassTarget then
+        clearTarget()
+        notify("SAE PASS","Another player received the ball",1.1)
     end
 
-    if holder~=State.lastHolder then
-        if holder==player and State.lastHolder~=player then
-            notify("BALL CONTROL","Ball is now yours",1.5)
-        elseif State.lastHolder==player and holder~=player and not State.saePassActive then
-            notify("BALL CONTROL","Ball left local player",1.2)
+    if State.stealBallEnabled then
+        if State.autoStealOffOnGet and localHasBall() then
+            State.stealBallEnabled=false
+            State.stealLastTarget=nil
+            State.stealSlideCooldown=0
+            notify("STEAL BALL","Tự động tắt — bạn đã có bóng",1.4)
+        else
+            stealBallStep(dt)
         end
-        State.lastHolder=holder
     end
 
     if State.tpActive then
-        if state=="HELD" and holder==player then
+        if State.gkSpecialEnabled then
+            if os.clock()>=State.gkSpecialReturnAt then
+                restoreTemporaryTP("GK special returned")
+            end
+        elseif state=="HELD" and holder==player then
             restoreTemporaryTP("Ball is yours")
         elseif os.clock()-State.tpStartedAt>=State.tpDuration then
             restoreTemporaryTP("TP timer expired")
         end
     end
 
-    if State.stealBallEnabled then
-        if State.autoStealOffOnGet and localHasBall() then
-            State.stealBallEnabled = false
-        else
-            State.stealCooldown += dt
-            if State.stealCooldown >= 0.025 then
-                stealBallStep()
-                State.stealCooldown = 0
-            end
-        end
+    if State.enabled and State.mode==1 and ball then
+        controlMode1(ball)
     end
 
-    if State.enabled and ball then
-        if State.mode==1 then controlMode1(ball)
-        elseif State.mode==2 then controlMode2(ball) end
-    end
-
-    if State.saePassActive and holder and holder~=player and holder==State.saePassTarget then
-        clearTarget()
-        notify("SAE PASS","Target received the ball",1.3)
-    elseif State.saePassActive and holder and holder~=player and holder~=State.saePassTarget then
-        clearTarget()
-        notify("SAE PASS","Another player received the ball",1.3)
-    end
-
-    if State.mode==1 or State.mode==2 then
+    if State.mode==1 then
         applyModeLock()
     elseif rootPart and rootPart.Anchored then
         rootPart.Anchored=false
@@ -1739,13 +1696,13 @@ player.CharacterAdded:Connect(function()
     playerWasLocked=false
     savedWalkSpeed,savedJumpPower,savedAutoRotate=nil,nil,nil
     clearTarget()
-    resetMode5()
-    State.mode3Active=false
-    clearEndpoint()
     State.tpActive=false
     State.tpReturnCFrame=nil
+    State.gkSpecialEnabled=false
+    State.gkSpecialReturnAt=0
+    State.gkLastGoalPart=nil
     State.forceUnanchorActive=false
-    if State.enabled and (State.mode==1 or State.mode==2) and State.anchorEnabled then applyModeLock() else unlockPlayer() end
+    if State.enabled and State.mode==1 and State.anchorEnabled then applyModeLock() else unlockPlayer() end
     updateUI()
 end)
 
@@ -1768,6 +1725,9 @@ if shootRemoteReady then
     notify("SHOOT REMOTE","ShootBall detected",1.5)
 else
     notify("SHOOT REMOTE","Events.ShootBall chưa tìm thấy",2)
+end
+if not VirtualInputManager then
+    notify("STEAL BALL","VirtualInputManager không khả dụng — Auto Slide sẽ không gửi E",2)
 end
 notify("BALL CONTROLLER","V3 loaded",1.5)
 print("[Ball Controller V3] loaded")
