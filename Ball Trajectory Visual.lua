@@ -255,8 +255,6 @@ end
 -- ==========================================
 -- [ FIND BALL HOLDER ]
 -- ==========================================
--- This function is deliberately cached/throttled.
--- It does not recursively scan every character every frame.
 
 local function scanBallHolder()
     local possibleNames = {
@@ -271,7 +269,6 @@ local function scanBallHolder()
         local character = player.Character
 
         if character then
-            -- Fast path: equipped Tool / Handle / Ball.
             local tool = character:FindFirstChildOfClass("Tool")
 
             if tool then
@@ -286,7 +283,6 @@ local function scanBallHolder()
                 end
             end
 
-            -- Fast path: immediate children only.
             for _, name in ipairs(possibleNames) do
                 local alternateBall = character:FindFirstChild(name)
 
@@ -297,9 +293,6 @@ local function scanBallHolder()
         end
     end
 
-    -- Slow fallback:
-    -- Some games place the Ball deeper inside the character.
-    -- This is still throttled by HOLDER_SCAN_INTERVAL.
     for _, player in ipairs(Players:GetPlayers()) do
         local character = player.Character
 
@@ -394,7 +387,6 @@ local function updateMovementEstimate(ball, holder)
     local now = os.clock()
     local currentPos = ball.Position
 
-    -- Held ball: use holder orientation as predicted direction.
     if holder then
         local direction = getHolderDirection(holder)
 
@@ -433,7 +425,6 @@ local function updateMovementEstimate(ball, holder)
         return
     end
 
-    -- Free ball: estimate movement from observed position changes.
     if not lastObservedPosition then
         lastObservedPosition = currentPos
         lastObservedTime = now
@@ -563,7 +554,6 @@ local function predictTrajectory(ball)
 
     local currentPos = ball.Position
 
-    -- Use the game's actual gravity, including 0 gravity.
     local gravityValue = Workspace.Gravity
     local gravity = Vector3.new(0, -gravityValue, 0)
 
@@ -646,7 +636,6 @@ local function predictTrajectory(ball)
         end
     end
 
-    -- Downward ground ray only when there was no bounce.
     if bounceCount == 0 and #cachedPoints > 0 then
         local lastPoint = cachedPoints[#cachedPoints]
 
@@ -690,7 +679,7 @@ local function getOrCreateBeam(index)
         local attachment = Instance.new("Attachment")
 
         attachment.Name = "Att_" .. tostring(index)
-        attachment.Parent = Workspace.Terrain
+        attachment.Parent = targetFolder
 
         AttachmentsPool[index] = attachment
     end
@@ -706,7 +695,6 @@ local function getOrCreateBeam(index)
     local beam = BeamsPool[index - 1]
 
     if beam then
-        -- Rebind every frame in case an attachment was recreated.
         beam.Attachment0 = AttachmentsPool[index - 1]
         beam.Attachment1 = AttachmentsPool[index]
 
@@ -732,13 +720,13 @@ local function createArrow()
     if not ArrowAttachment0 then
         ArrowAttachment0 = Instance.new("Attachment")
         ArrowAttachment0.Name = "DirectionArrow_Start"
-        ArrowAttachment0.Parent = Workspace.Terrain
+        ArrowAttachment0.Parent = folder
     end
 
     if not ArrowAttachment1 then
         ArrowAttachment1 = Instance.new("Attachment")
         ArrowAttachment1.Name = "DirectionArrow_End"
-        ArrowAttachment1.Parent = Workspace.Terrain
+        ArrowAttachment1.Parent = folder
     end
 
     if not ArrowBeam then
@@ -948,7 +936,6 @@ local function renderLoop()
         end
     end
 
-    -- Detect release transition.
     if previousHolder and not holder then
         estimatedVelocity = smoothedHorizontalVelocity
     end
@@ -1111,7 +1098,6 @@ MainFrame.InputBegan:Connect(function(input)
     end
 end)
 
--- Global release handler fixes the "stuck dragging" issue.
 UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch
