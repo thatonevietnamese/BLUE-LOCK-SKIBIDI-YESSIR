@@ -87,6 +87,11 @@ local State = {
     tpStartedAt = 0,
     tpReturnCFrame = nil,
     tpGoalActive = false,
+    tpFollowTarget = nil,
+    tpFollowBall = nil,
+    advanceMode = false,
+    advanceKeys = {W=false,A=false,S=false,D=false,Q=false,E=false},
+    advanceCameraOffset = Vector3.new(0, 7, 14),
 }
 
 -- NOTIFICATIONS
@@ -614,6 +619,11 @@ local mode1Box = makeBox(settingsContent,modeSettings[1].speed,120,6,220,32)
 local mode1Hint = makeLabel(settingsContent,"Mode 1: bóng chạy liên tục theo hướng camera khi control đang ACTIVE.",10,70,440,80,11)
 mode1Hint.TextWrapped=true
 mode1Hint.TextColor3=Color3.fromRGB(145,145,155)
+local mode1AdvanceLabel = makeLabel(settingsContent,"ADVANCE MODE",10,120,110,25,12)
+local mode1AdvanceButton = makeButton(settingsContent,"OFF",120,116,120,32)
+local mode1AdvanceHint = makeLabel(settingsContent,"Advance Mode: camera bám trực tiếp vào bóng; WASD cho bóng đi theo hướng camera, Q/E tăng giảm độ cao theo trục Y.",10,160,440,55,11)
+mode1AdvanceHint.TextWrapped=true
+mode1AdvanceHint.TextColor3=Color3.fromRGB(145,145,155)
 
 local mode2Label = makeLabel(settingsContent,"SPEED",10,10,110,25,12)
 local mode2Box = makeBox(settingsContent,modeSettings[2].speed,120,6,220,32)
@@ -657,11 +667,15 @@ local function refreshSettingsPanel()
     mode1Label.Visible=mode1
     mode1Box.Visible=mode1
     mode1Hint.Visible=mode1
+    mode1AdvanceLabel.Visible=mode1
+    mode1AdvanceButton.Visible=mode1
+    mode1AdvanceHint.Visible=mode1
     mode2Label.Visible=mode2
     mode2Box.Visible=mode2
     mode2Hint.Visible=mode2
 
     setGeneralControls()
+    mode1AdvanceButton.Text=State.advanceMode and "ON" or "OFF"
 end
 
 for i=1,3 do
@@ -706,6 +720,30 @@ end)
 
 mode1Box.FocusLost:Connect(function()
     modeSettings[1].speed=parseSetting(mode1Box,modeSettings[1].speed,MIN_SPEED,MAX_SPEED)
+end)
+
+local function setAdvanceMode(value)
+    State.advanceMode=value and true or false
+    mode1AdvanceButton.Text=State.advanceMode and "ON" or "OFF"
+    State.advanceKeys={W=false,A=false,S=false,D=false,Q=false,E=false}
+    if State.advanceMode then
+        State.advanceCameraOffset=Vector3.new(0,7,14)
+        if State.mode==1 and State.enabled then
+            camera=workspace.CurrentCamera
+            if camera then camera.CameraType=Enum.CameraType.Scriptable end
+        end
+    else
+        State.advanceCameraOffset=Vector3.new(0,7,14)
+        if State.mode==1 and State.enabled then
+            local ball=findBall()
+            if ball then cameraToBall(ball) else restoreCamera() end
+        end
+    end
+end
+
+mode1AdvanceButton.MouseButton1Click:Connect(function()
+    setAdvanceMode(not State.advanceMode)
+    notify("ADVANCE MODE",State.advanceMode and "ON" or "OFF",1.2)
 end)
 
 mode2Box.FocusLost:Connect(function()
@@ -805,6 +843,42 @@ local function getCameraDirection()
     if not camera then return Vector3.new(0,0,-1) end
     local d=camera.CFrame.LookVector
     return d.Magnitude>0 and d.Unit or Vector3.new(0,0,-1)
+end
+
+--========================================================--
+-- ADVANCE MODE CAMERA
+--========================================================--
+
+local function updateAdvanceCamera(ball,dt)
+    if not State.advanceMode or not State.enabled or not ball then return false end
+    camera=workspace.CurrentCamera
+    if not camera then return false end
+
+    -- Advance Mode = Mode 1 cũ nhưng camera bám trực tiếp vào bóng.
+    -- WASD: di chuyển theo hướng camera (mặt phẳng XZ).
+    -- Q/E: tăng/giảm độ cao theo đúng trục Y.
+    camera.CameraType=Enum.CameraType.Custom
+    camera.CameraSubject=ball
+
+    local f,r=getFlatCameraDirections()
+    local move=Vector3.zero
+
+    if State.advanceKeys.W then move+=f end
+    if State.advanceKeys.S then move-=f end
+    if State.advanceKeys.D then move+=r end
+    if State.advanceKeys.A then move-=r end
+    if State.advanceKeys.E then move+=Vector3.new(0,1,0) end
+    if State.advanceKeys.Q then move-=Vector3.new(0,1,0) end
+
+    local speed=math.clamp(modeSettings[1].speed,MIN_SPEED,MAX_SPEED)
+    if move.Magnitude>0 then
+        ball.AssemblyLinearVelocity=move.Unit*speed
+    else
+        -- Không nhấn phím: giữ bóng tại độ cao hiện tại thay vì để rơi.
+        ball.AssemblyLinearVelocity=Vector3.zero
+    end
+
+    return true
 end
 
 --========================================================--
@@ -1175,16 +1249,13 @@ local function performGKTPReturn()
     -- Sau Q: nếu có người giữ bóng thì TP tới người đó.
     -- Nếu bóng đang free thì TP trực tiếp tới bóng. Không phụ thuộc team.
     local targetRoot,holder=getCurrentBallTarget()
+    State.tpFollowTarget=holder
+    State.tpFollowBall=(holder and nil or targetRoot)
     if targetRoot then
-        if holder then
-            rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
-            notify("GK RETURN","Q DIVE → TP → "..holder.Name,1.4)
-        else
-            rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
-            notify("GK RETURN","Q DIVE → TP → FREE BALL",1.4)
-        end
+        rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
+        notify("GK RETURN",holder and ("Q DIVE → TP → "..holder.Name) or "Q DIVE → TP → FREE BALL",1.4)
     else
-        notify("GK RETURN","Q DIVE → chưa tìm thấy bóng",1.3)
+        notify("GK RETURN","Q DIVE → đang chờ bóng",1.3)
     end
 
     return true
@@ -1332,6 +1403,8 @@ local function restoreTemporaryTP(reason)
     State.tpActive=false
     State.tpReturnCFrame=nil
     State.tpGoalActive=false
+    State.tpFollowTarget=nil
+    State.tpFollowBall=nil
     State.gkSpecialEnabled=false
     State.gkSpecialReturnAt=0
     State.gkLastGoalPart=nil
@@ -1386,6 +1459,8 @@ local function startTemporaryTP()
     State.tpGoalActive=false
     State.tpActive=true
     State.tpStartedAt=os.clock()
+    State.tpFollowTarget=(state=="HELD" and holder) or nil
+    State.tpFollowBall=(state=="FREE" and ball) or nil
     rootPart.CFrame=CFrame.new(targetPosition)
     notify("TP RETURN",string.format("TP → %s trong %.2fs",targetName,State.tpDuration),1.5)
 end
@@ -1462,6 +1537,7 @@ end)
 
 modeButton.MouseButton1Click:Connect(function()
     State.mode=(State.mode==1) and 2 or 1
+    if State.mode~=1 and State.advanceMode then setAdvanceMode(false) end
     State.enabled=false
     State.forceUnanchorActive=false
     if rootPart then rootPart.Anchored=false end
@@ -1469,7 +1545,14 @@ modeButton.MouseButton1Click:Connect(function()
     restoreCamera()
     if State.mode==1 then
         local ball=findBall()
-        if ball then cameraToBall(ball) end
+        if ball then
+            if State.advanceMode then
+                camera=workspace.CurrentCamera
+                camera.CameraType=Enum.CameraType.Scriptable
+            else
+                cameraToBall(ball)
+            end
+        end
     end
     updateUI()
     notify("MODE",modeName(),1.3)
@@ -1554,6 +1637,15 @@ UserInputService.InputBegan:Connect(function(input,gameProcessed)
 
     if input.UserInputType~=Enum.UserInputType.Keyboard then return end
 
+    if State.advanceMode and State.mode==1 then
+        if input.KeyCode==Enum.KeyCode.W then State.advanceKeys.W=true; return end
+        if input.KeyCode==Enum.KeyCode.A then State.advanceKeys.A=true; return end
+        if input.KeyCode==Enum.KeyCode.S then State.advanceKeys.S=true; return end
+        if input.KeyCode==Enum.KeyCode.D then State.advanceKeys.D=true; return end
+        if input.KeyCode==Enum.KeyCode.Q then State.advanceKeys.Q=true; return end
+        if input.KeyCode==Enum.KeyCode.E then State.advanceKeys.E=true; return end
+    end
+
     if State.changingControlKey then
         if input.KeyCode==Enum.KeyCode.Escape then
             State.changingControlKey=false
@@ -1594,7 +1686,12 @@ UserInputService.InputBegan:Connect(function(input,gameProcessed)
             State.enabled=not State.enabled
             if State.enabled then
                 State.forceUnanchorActive=false
-                if ball then cameraToBall(ball) end
+                if State.advanceMode then
+                    camera=workspace.CurrentCamera
+                    if camera then camera.CameraType=Enum.CameraType.Scriptable end
+                elseif ball then
+                    cameraToBall(ball)
+                end
                 applyModeLock()
                 notify("CONTROL",modeName().." ACTIVE",1.1)
             else
@@ -1627,8 +1724,41 @@ UserInputService.InputEnded:Connect(function(input)
         end
     elseif input.UserInputType==Enum.UserInputType.MouseButton2 then
         State.rightMouseHeld=false
+    elseif input.UserInputType==Enum.UserInputType.Keyboard then
+        if input.KeyCode==Enum.KeyCode.W then State.advanceKeys.W=false end
+        if input.KeyCode==Enum.KeyCode.A then State.advanceKeys.A=false end
+        if input.KeyCode==Enum.KeyCode.S then State.advanceKeys.S=false end
+        if input.KeyCode==Enum.KeyCode.D then State.advanceKeys.D=false end
+        if input.KeyCode==Enum.KeyCode.Q then State.advanceKeys.Q=false end
+        if input.KeyCode==Enum.KeyCode.E then State.advanceKeys.E=false end
     end
 end)
+
+--========================================================--
+-- TP FOLLOW
+--========================================================--
+
+local function updateTPFollowTarget()
+    if not State.tpActive or not updateCharacter() or not rootPart then return end
+
+    local state,holder,ball=getBallState()
+    local targetRoot=nil
+    if state=="HELD" and holder and holder~=player then
+        targetRoot=getPlayerRoot(holder)
+        if targetRoot then
+            State.tpFollowTarget=holder
+            State.tpFollowBall=nil
+        end
+    elseif state=="FREE" and ball then
+        targetRoot=ball
+        State.tpFollowTarget=nil
+        State.tpFollowBall=ball
+    end
+
+    if targetRoot then
+        rootPart.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0))
+    end
+end
 
 --========================================================--
 -- HEARTBEAT
@@ -1660,19 +1790,20 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     if State.tpActive then
+        updateTPFollowTarget()
         if State.gkSpecialEnabled then
             if os.clock()>=State.gkSpecialReturnAt then
                 restoreTemporaryTP("GK special returned")
             end
-        elseif state=="HELD" and holder==player then
-            restoreTemporaryTP("Ball is yours")
         elseif os.clock()-State.tpStartedAt>=State.tpDuration then
             restoreTemporaryTP("TP timer expired")
         end
     end
 
     if State.enabled and State.mode==1 and ball then
-        controlMode1(ball)
+        if not updateAdvanceCamera(ball,dt) then
+            controlMode1(ball)
+        end
     end
 
     if State.mode==1 then
@@ -1701,6 +1832,10 @@ player.CharacterAdded:Connect(function()
     State.gkSpecialEnabled=false
     State.gkSpecialReturnAt=0
     State.gkLastGoalPart=nil
+    State.tpFollowTarget=nil
+    State.tpFollowBall=nil
+    State.advanceKeys={W=false,A=false,S=false,D=false,Q=false,E=false}
+    State.advanceCameraOffset=Vector3.new(0,7,14)
     State.forceUnanchorActive=false
     if State.enabled and State.mode==1 and State.anchorEnabled then applyModeLock() else unlockPlayer() end
     updateUI()
