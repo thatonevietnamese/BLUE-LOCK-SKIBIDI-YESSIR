@@ -460,7 +460,7 @@ local stealButton = makeButton(main,"STEAL BALL: OFF",10,180,160,36)
 local saeButton = makeButton(main,"SAE PASS: OFF",180,180,160,36)
 local settingsButton = makeButton(main,"⚙ SETTINGS",10,224,160,36)
 local statusButton = makeButton(main,"BALL STATUS: ON",180,224,160,36)
-local tpButton = makeButton(main,"TP RETURN",10,268,150,36)
+local tpButton = makeButton(main,"TP BÓNG",10,268,150,36)
 local tpGoalButton = makeButton(main,"TP GOAL",170,268,170,36)
 local tpTimeBox = makeBox(main,State.tpDuration,250,310,90,36)
 
@@ -1371,14 +1371,26 @@ local function stealBallStep(dt)
 end
 
 --========================================================--
--- TP GOAL
--- Home -> PlayerTwoGoal.ScoreHitbox
--- Away -> PlayerOneGoal.ScoreHitbox
+-- TP GOAL / TP BÓNG
+-- Hai nút này dịch chuyển QUẢ BÓNG, không dịch chuyển player.
+-- TP GOAL: đưa bóng tới ScoreHitbox đối diện.
+-- TP BÓNG: đưa bóng tới vị trí player hiện tại.
 --========================================================--
 
+local function setBallCFrame(ball, cframe)
+    if not ball then return false end
+    pcall(function()
+        ball.AssemblyLinearVelocity=Vector3.zero
+        ball.AssemblyAngularVelocity=Vector3.zero
+        ball.CFrame=cframe
+    end)
+    return true
+end
+
 local function startTPGoal()
-    if not updateCharacter() or not rootPart then
-        notify("TP GOAL","Không tìm thấy nhân vật",1.2)
+    local state,holder,ball=getBallState()
+    if not ball then
+        notify("TP GOAL","Không tìm thấy bóng",1.2)
         return
     end
 
@@ -1388,9 +1400,26 @@ local function startTPGoal()
         return
     end
 
-    rootPart.CFrame=CFrame.new(goalPart.Position+GK_TP_OFFSET)
+    setBallCFrame(ball,CFrame.new(goalPart.Position+GK_TP_OFFSET))
     State.tpGoalActive=true
-    notify("TP GOAL",getTeamIsHome() and "HOME → PLAYER TWO GOAL" or "AWAY → PLAYER ONE GOAL",1.3)
+    notify("TP GOAL",getTeamIsHome() and "BÓNG → PLAYER TWO GOAL" or "BÓNG → PLAYER ONE GOAL",1.3)
+end
+
+local function startTPBall()
+    if not updateCharacter() or not rootPart then
+        notify("TP BÓNG","Không tìm thấy nhân vật",1.2)
+        return
+    end
+
+    local state,holder,ball=getBallState()
+    if not ball then
+        notify("TP BÓNG","Không tìm thấy bóng",1.2)
+        return
+    end
+
+    local targetCFrame=CFrame.new(rootPart.Position+Vector3.new(0,2.5,0))
+    setBallCFrame(ball,targetCFrame)
+    notify("TP BÓNG",holder and ("Bóng → "..holder.Name) or "Bóng → LocalPlayer",1.3)
 end
 
 --========================================================--
@@ -1589,7 +1618,7 @@ saeButton.MouseButton1Click:Connect(function()
     notify("SAE PASS",State.saePassEnabled and "ON" or "OFF",1.3)
 end)
 
-tpButton.MouseButton1Click:Connect(startTemporaryTP)
+tpButton.MouseButton1Click:Connect(startTPBall)
 tpGoalButton.MouseButton1Click:Connect(startTPGoal)
 
 --========================================================--
