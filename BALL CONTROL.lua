@@ -460,15 +460,15 @@ local stealButton = makeButton(main,"STEAL BALL: OFF",10,180,160,36)
 local saeButton = makeButton(main,"SAE PASS: OFF",180,180,160,36)
 local settingsButton = makeButton(main,"⚙ SETTINGS",10,224,160,36)
 local statusButton = makeButton(main,"BALL STATUS: ON",180,224,160,36)
-local tpButton = makeButton(main,"TP BÓNG",10,268,150,36)
+local tpButton = makeButton(main,"TP RETURN",10,268,150,36)
 local tpGoalButton = makeButton(main,"TP GOAL",170,268,170,36)
 local tpTimeBox = makeBox(main,State.tpDuration,250,310,90,36)
 
 local info = makeLabel(main,
     "F = action theo mode.\n"..
-    "Mode 1: bật/tắt control; bóng chạy theo camera.\n"..
+    "Mode 1: bật/tắt control; điều khiển physics của bóng, không cần local player cầm bóng.\n"..
     "Mode 2: F để sút một lần theo camera.\n"..
-    "SAE Pass Mode 1 = rise + chase; Mode 2 = direct hold.\n"..
+    "SAE Pass: ShootBall release trước → sau đó TP tới receiver; Mode 1 rise + chase.\n"..
     "GK: TP RETURN → GoalArea + Q dive → tự bám người cầm bóng.\n"..
     "Barou: Steal Ball không quan tâm đồng đội.",
     10,350,330,70,11)
@@ -979,20 +979,51 @@ local function startSaePass(ball,target)
     )
     State.saePassStartTime=os.clock()
 
-    if State.mode==2 then
-        -- SAE PASS MODE 2: direct move/hold at the receiver until they actually receive it.
-        State.saePassStage="DIRECT"
-        ball.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,2.5,0))
-        ball.AssemblyLinearVelocity=Vector3.zero
-        notify("SAE PASS","MODE 2 DIRECT → "..target.Name,1.3)
-    else
-        -- SAE PASS MODE 1: rise first, then continuously steer toward the moving receiver.
+    -- QUAN TRỌNG:
+    -- SAE Pass phải RELEASE bóng bằng chính ShootBall trước.
+    -- Không CFrame/giữ bóng trực tiếp nữa vì như vậy bóng có thể vẫn bị
+    -- weld/hold với người chuyền.
+    local releaseDirection
+    local releaseForce
+
+    if State.mode==1 then
+        -- Mode 1: thả bóng theo hướng lên trước, sau đó chase tới receiver.
+        releaseDirection=Vector3.new(0,1,0)
+        releaseForce=math.clamp(SAE_PASS_SPEED*0.32,MIN_SPEED,MAX_SPEED)
         State.saePassStage="RISING"
-        local riseForce=math.clamp(SAE_PASS_SPEED*0.32,MIN_SPEED,MAX_SPEED)
-        fireShootRemote(Vector3.new(0,1,0),riseForce,false)
         State.saePassTopY=ball.Position.Y+math.min(SAE_PASS_HEIGHT,90)
-        notify("SAE PASS","MODE 1 RISING → "..target.Name,1.3)
+    else
+        -- Mode 2: vẫn phải dùng ShootBall để server thực sự nhả bóng.
+        -- Sau khi nhả, heartbeat sẽ điều khiển quỹ đạo tới receiver.
+        releaseDirection=getCameraDirection()
+        releaseForce=math.clamp(modeSettings[2].speed,MIN_SPEED,MAX_SPEED)
+        State.saePassStage="TRAVEL"
     end
+
+    if not fireShootRemote(releaseDirection,releaseForce,false) then
+        clearTarget()
+        notify("SAE PASS","ShootBall không thể release bóng",1.3)
+        return false
+    end
+
+    notify("SAE PASS","ShootBall RELEASE → "..target.Name,1.1)
+
+    -- RELEASE xong mới TP. Chờ server xử lý việc tháo bóng khỏi holder.
+    task.spawn(function()
+        task.wait(0.06)
+
+        if not State.saePassActive then return end
+        if State.saePassTarget~=target then return end
+        if not updateCharacter() or not rootPart then return end
+
+        local receiverRoot=getPlayerRoot(target)
+        if receiverRoot then
+            rootPart.CFrame=CFrame.new(
+                receiverRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0)
+            )
+            notify("SAE PASS","RELEASED → TP → "..target.Name,1.2)
+        end
+    end)
 
     if targetHighlight then targetHighlight.FillTransparency=0.85 end
     return true
@@ -1018,11 +1049,8 @@ local function updateSaePass()
     -- We keep the pass state alive until the target actually receives it.
 
     if State.saePassStage=="DIRECT" then
-        if not localHasBall() then
-            ball.CFrame=CFrame.new(targetRoot.Position+Vector3.new(0,2.5,0))
-            ball.AssemblyLinearVelocity=Vector3.zero
-        end
-        return
+        -- Legacy state only; a new SAE pass never enters DIRECT.
+        State.saePassStage="TRAVEL"
     end
 
     if State.saePassStage=="RISING" then
@@ -1424,56 +1452,74 @@ end
 
 --========================================================--
 -- TP RETURN
+-- Cơ chế lấy nguyên theo script tham chiếu:
+-- Normal: TP tới người đang giữ bóng địch / free ball, sau đó tự return.
+-- GK: TP về GoalArea đội mình -> Q dive -> TP tới holder/free ball,
+--     rồi return theo GK special duration.
 --========================================================--
 
 local function restoreTemporaryTP(reason)
     if not State.tpActive then return end
+
     local saved=State.tpReturnCFrame
+
     State.tpActive=false
     State.tpReturnCFrame=nil
     State.tpGoalActive=false
-    State.tpFollowTarget=nil
-    State.tpFollowBall=nil
     State.gkSpecialEnabled=false
     State.gkSpecialReturnAt=0
     State.gkLastGoalPart=nil
-    if saved and updateCharacter() and rootPart then rootPart.CFrame=saved end
-    if reason then notify("TP RETURN",reason,1.2) end
+
+    if saved and updateCharacter() and rootPart then
+        rootPart.CFrame=saved
+    end
+
+    if reason then
+        notify("TP RETURN",reason,1.2)
+    end
 end
 
 local function startTemporaryTP()
+    -- Bấm lần nữa khi đang TP = trả player về vị trí cũ.
     if State.tpActive then
         State.gkSpecialEnabled=false
         State.gkLastGoalPart=nil
         restoreTemporaryTP("Returned")
         return
     end
+
     if not updateCharacter() or not rootPart then
         notify("TP RETURN","Không tìm thấy nhân vật",1.2)
         return
     end
 
-    -- GK: ONLY run the dedicated GK flow. Do not merge with Steal Ball / E / target filtering.
+    -- GK dùng flow đặc biệt của script tham chiếu.
     if localIsGoalkeeper() then
         local savedBeforeGK=rootPart.CFrame
+
         if performGKTPReturn() then
             State.tpReturnCFrame=savedBeforeGK
             State.tpActive=true
             State.tpStartedAt=os.clock()
             return
         end
+
         return
     end
 
+    -- Normal player: chỉ TP tới holder địch hoặc free ball.
     local state,holder,ball=getBallState()
     local targetPosition,targetName
 
-    if state=="HELD" and holder and holder~=player and (localIsBarou() or not sameTeam(holder)) then
+    if state=="HELD" and holder and holder~=player
+        and (localIsBarou() or not sameTeam(holder)) then
+
         local targetRoot=getPlayerRoot(holder)
         if targetRoot then
             targetPosition=targetRoot.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0)
             targetName=holder.Name
         end
+
     elseif state=="FREE" and ball then
         targetPosition=ball.Position+Vector3.new(0,DEFAULT_STEAL_DISTANCE,0)
         targetName="FREE BALL"
@@ -1488,10 +1534,14 @@ local function startTemporaryTP()
     State.tpGoalActive=false
     State.tpActive=true
     State.tpStartedAt=os.clock()
-    State.tpFollowTarget=(state=="HELD" and holder) or nil
-    State.tpFollowBall=(state=="FREE" and ball) or nil
+
     rootPart.CFrame=CFrame.new(targetPosition)
-    notify("TP RETURN",string.format("TP → %s trong %.2fs",targetName,State.tpDuration),1.5)
+
+    notify(
+        "TP RETURN",
+        string.format("TP → %s trong %.2fs",targetName,State.tpDuration),
+        1.5
+    )
 end
 
 --========================================================--
@@ -1618,7 +1668,7 @@ saeButton.MouseButton1Click:Connect(function()
     notify("SAE PASS",State.saePassEnabled and "ON" or "OFF",1.3)
 end)
 
-tpButton.MouseButton1Click:Connect(startTPBall)
+tpButton.MouseButton1Click:Connect(startTemporaryTP)
 tpGoalButton.MouseButton1Click:Connect(startTPGoal)
 
 --========================================================--
@@ -1693,6 +1743,13 @@ UserInputService.InputBegan:Connect(function(input,gameProcessed)
     end
 
     if input.KeyCode==State.controlKey then
+        -- MODE 1 KHÔNG ĐƯỢC PHÉP CHẠY/TOGGLE trong lúc SAE PASS đang triển khai.
+        -- F vẫn được dành riêng cho chính chuỗi SAE PASS.
+        if State.saePassActive and State.mode==1 and not State.saePassEnabled then
+            notify("MODE 1", "Bị khóa — SAE PASS đang triển khai", 1.3)
+            return
+        end
+
         -- SAE PASS: hold LMB + F to select a teammate; F again can launch immediately.
         if State.saePassEnabled and State.leftMouseHeld then
             if not State.selectedTarget then
@@ -1830,7 +1887,10 @@ RunService.Heartbeat:Connect(function(dt)
     end
 
     if State.enabled and State.mode==1 and ball then
-        if not updateAdvanceCamera(ball,dt) then
+        if State.saePassActive then
+            -- SAE PASS đang chạy: tuyệt đối không cho Mode 1 ghi đè physics của bóng.
+            -- SAE PASS tự điều khiển ball sau khi ShootBall đã release.
+        elseif not updateAdvanceCamera(ball,dt) then
             controlMode1(ball)
         end
     end
