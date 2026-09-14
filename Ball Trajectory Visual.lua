@@ -287,14 +287,13 @@ local function getHolderDirection(holder)
 end
 
 -- ==========================================
--- [ MOVEMENT ESTIMATION (FIXED TELEPORT) ]
+-- [ MOVEMENT ESTIMATION ]
 -- ==========================================
 
 local function updateMovementEstimate(ball, holder)
     local now = os.clock()
     local currentPos = ball.Position
 
-    -- ĐỔI BÓNG HOẶC SANG VÁN MỚI -> RESET BỘ NHỚ
     if lastBallInstance ~= ball then
         lastBallInstance = ball
         resetMovementCache()
@@ -303,7 +302,6 @@ local function updateMovementEstimate(ball, holder)
         return
     end
 
-    -- PHÁT HIỆN TELEPORT (Nếu bóng di chuyển > 30 studs trong 1 frame = Reset ván mới)
     if lastObservedPosition and (currentPos - lastObservedPosition).Magnitude > 30 then
         resetMovementCache()
         lastObservedPosition = currentPos
@@ -511,6 +509,11 @@ end
 local function createArrow()
     local folder = getVisualFolder()
 
+    -- KIỂM TRA LẠI CÁC PHẦN TỬ CŨ: Nếu bị mất Parent (do reset map) -> Đặt về nil để tạo mới
+    if ArrowAttachment0 and not ArrowAttachment0.Parent then ArrowAttachment0 = nil end
+    if ArrowAttachment1 and not ArrowAttachment1.Parent then ArrowAttachment1 = nil end
+    if ArrowBeam and not ArrowBeam.Parent then ArrowBeam = nil end
+
     if not ArrowAttachment0 then
         ArrowAttachment0 = Instance.new("Attachment")
         ArrowAttachment0.Name = "DirectionArrow_Start"
@@ -526,14 +529,15 @@ local function createArrow()
     if not ArrowBeam then
         ArrowBeam = Instance.new("Beam")
         ArrowBeam.Name = "DirectionArrow"
-        ArrowBeam.Attachment0 = ArrowAttachment0
-        ArrowBeam.Attachment1 = ArrowAttachment1
-        ArrowBeam.FaceCamera = true
-        ArrowBeam.Width0 = Config.ArrowWidth
-        ArrowBeam.Width1 = Config.ArrowWidth * 0.55
-        ArrowBeam.Color = ColorSequence.new(Config.CurrentColor)
         ArrowBeam.Parent = folder
     end
+
+    ArrowBeam.Attachment0 = ArrowAttachment0
+    ArrowBeam.Attachment1 = ArrowAttachment1
+    ArrowBeam.FaceCamera = true
+    ArrowBeam.Width0 = Config.ArrowWidth
+    ArrowBeam.Width1 = Config.ArrowWidth * 0.55
+    ArrowBeam.Color = ColorSequence.new(Config.CurrentColor)
 end
 
 createArrow()
@@ -560,14 +564,13 @@ local function renderDirectionArrow(ball)
     end
 
     if speed < Config.MinArrowSpeed or horizontal.Magnitude < 0.001 then
-        ArrowBeam.Enabled = false
+        if ArrowBeam then ArrowBeam.Enabled = false end
         return
     end
 
     local direction = horizontal.Unit
     local arrowLength = math.clamp(speed * Config.ArrowScale, Config.MinArrowLength, Config.MaxArrowLength)
 
-    -- Khóa gốc mũi tên trực tiếp vào vị trí hiện tại của bóng
     ArrowAttachment0.WorldPosition = ball.Position
     ArrowAttachment1.WorldPosition = ball.Position + direction * arrowLength
 
