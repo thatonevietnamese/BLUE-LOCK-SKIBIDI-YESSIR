@@ -41,6 +41,7 @@ local State = {
 	stealBallEnabled = false,
 	autoGoalEnabled = false,
 	autoGoalExecuting = false,
+	autoGoalRunId = 0,
 
 	saePassEnabled = false,
 	selectedTarget = nil,
@@ -203,7 +204,6 @@ notify = function(titleText, bodyText, duration)
 	card.BorderSizePixel = 0
 	card.Parent = notificationHolder
 
-	corner = nil
 
 	local uiCorner = Instance.new("UICorner")
 	uiCorner.CornerRadius = UDim.new(0, 9)
@@ -530,7 +530,8 @@ local function getBallState()
 end
 
 local function localHasBall()
-	return BallTracker.State == "HELD" and BallTracker.Holder == player
+	local state, holder = GetCachedBallState()
+	return state == "HELD" and holder == player
 end
 
 local function getPlayerRoot(plr)
@@ -1265,6 +1266,8 @@ Bind(generalAutoGoalButton.MouseButton1Click, function()
 	State.autoGoalEnabled = not State.autoGoalEnabled
 
 	if State.autoGoalEnabled then
+		State.autoGoalRunId += 1
+		State.autoGoalExecuting = false
 		State.stealBallEnabled = false
 
 		notify(
@@ -1273,6 +1276,8 @@ Bind(generalAutoGoalButton.MouseButton1Click, function()
 			1.4
 		)
 	else
+		State.autoGoalRunId += 1
+		State.autoGoalExecuting = false
 		notify("AUTO GOAL", "OFF", 1.1)
 	end
 
@@ -1953,13 +1958,20 @@ local function performGKTPReturn()
 	task.wait(0.30)
 	sendVirtualKey(Enum.KeyCode.Q)
 
+	if not updateCharacter() or not rootPart or not rootPart.Parent then
+		State.gkSpecialEnabled = false
+		State.gkLastGoalPart = nil
+		return false
+	end
+
+	local currentRoot = rootPart
 	local targetRoot, holder = getCurrentBallTarget()
 
 	State.tpFollowTarget = holder
 	State.tpFollowBall = holder and nil or targetRoot
 
-	if targetRoot then
-		rootPart.CFrame = CFrame.new(
+	if targetRoot and targetRoot.Parent then
+		currentRoot.CFrame = CFrame.new(
 			targetRoot.Position + Vector3.new(0, DEFAULT_STEAL_DISTANCE, 0)
 		)
 
@@ -2006,15 +2018,14 @@ local function findBallTarget()
 end
 
 local function spamStealStep()
-	local _, _, currentRoot = getCharacter()
-
-	if not currentRoot or localHasBall() then
+	if not updateCharacter() or not rootPart or not rootPart.Parent or localHasBall() then
 		return
 	end
 
-	local targetPart, targetPlayer = findBallTarget()
+	local currentRoot = rootPart
+	local targetPart = findBallTarget()
 
-	if not targetPart then
+	if not targetPart or not targetPart.Parent then
 		return
 	end
 
@@ -2049,8 +2060,8 @@ local function startTPGoal()
 
 	local _, _, ball = getBallState()
 
-	if not ball then
-		notify("TP GOAL", "Không tìm thấy bóng", 1.2)
+	if not ball or not ball.Parent or not ball:IsA("BasePart") then
+		notify("TP GOAL", "Không tìm thấy bóng hợp lệ", 1.2)
 		return
 	end
 
@@ -2082,7 +2093,7 @@ local function restoreTemporaryTP(reason)
 	State.gkSpecialEnabled = false
 	State.gkLastGoalPart = nil
 
-	if saved and updateCharacter() and rootPart then
+	if saved and updateCharacter() and rootPart and rootPart.Parent then
 		rootPart.CFrame = saved
 	end
 
@@ -2181,10 +2192,13 @@ local function updateTPFollowTarget()
 		State.tpFollowBall = ball
 	end
 
-	if targetRoot then
+	if targetRoot and targetRoot.Parent then
 		rootPart.CFrame = CFrame.new(
 			targetRoot.Position + Vector3.new(0, DEFAULT_STEAL_DISTANCE, 0)
 		)
+	elseif state ~= "HELD" and state ~= "FREE" then
+		State.tpFollowTarget = nil
+		State.tpFollowBall = nil
 	end
 end
 
@@ -2380,6 +2394,78 @@ local function updateSaePass()
 end
 
 -- UI
+
+local function performAutoGoalStep()
+	if State.autoGoalExecuting or not State.autoGoalEnabled then
+		return
+	end
+
+	if not updateCharacter() or not rootPart or not rootPart.Parent then
+		return
+	end
+
+	local state, holder, ball = getBallState()
+	if state ~= "HELD" or holder ~= player or not ball or not ball.Parent then
+		return
+	end
+
+	local goalHitbox = resolveOpponentGoalHitbox()
+	if not goalHitbox or not goalHitbox.Parent then
+		return
+	end
+
+	State.autoGoalExecuting = true
+	State.autoGoalRunId += 1
+	local runId = State.autoGoalRunId
+
+	task.spawn(function()
+		local originalRoot = rootPart
+		local savedCFrame = originalRoot and originalRoot.CFrame
+
+		local ok, err = pcall(function()
+			if not originalRoot or not originalRoot.Parent or not State.autoGoalEnabled then
+				return
+			end
+
+			originalRoot.CFrame = CFrame.new(
+				goalHitbox.Position + TP_GOAL_OFFSET,
+				goalHitbox.Position
+			)
+
+			task.wait(0.02)
+
+			if not goalHitbox.Parent or not originalRoot.Parent then
+				return
+			end
+
+			local direction = goalHitbox.Position - originalRoot.Position
+			if direction.Magnitude > 0.001 then
+				fireShootRemote(direction.Unit, SHOOT_FORCE, false)
+			end
+
+			task.wait(0.02)
+
+			local _, _, currentBall = getBallState()
+			if currentBall and currentBall.Parent and currentBall:IsA("BasePart") then
+				currentBall.CFrame = goalHitbox.CFrame
+				currentBall.AssemblyLinearVelocity = Vector3.zero
+				currentBall.AssemblyAngularVelocity = Vector3.zero
+			end
+		end)
+
+		if not ok then
+			warn("[Ball Controller] Auto Goal error: " .. tostring(err))
+		end
+
+		if savedCFrame and originalRoot and originalRoot.Parent then
+			originalRoot.CFrame = savedCFrame
+		end
+
+		if State.autoGoalRunId == runId then
+			State.autoGoalExecuting = false
+		end
+	end)
+end
 
 local function modeName()
 	return State.mode == 1
@@ -3030,45 +3116,7 @@ Bind(RunService.Heartbeat, function()
 
 	if State.autoGoalEnabled then
 		if localHasBall() then
-			if not State.autoGoalExecuting then
-				State.autoGoalExecuting = true
-
-				local goalHitbox = resolveOpponentGoalHitbox()
-
-				if goalHitbox and rootPart then
-					local savedCFrame = rootPart.CFrame
-
-					rootPart.CFrame = CFrame.new(
-						goalHitbox.Position + TP_GOAL_OFFSET,
-						goalHitbox.Position
-					)
-
-					task.wait(0.02)
-
-					local shootDir =
-						(goalHitbox.Position - rootPart.Position).Unit
-
-					fireShootRemote(
-						shootDir,
-						SHOOT_FORCE,
-						false
-					)
-
-					task.wait(0.02)
-
-					local _, _, currentBall = getBallState()
-
-					if currentBall then
-						currentBall.CFrame = goalHitbox.CFrame
-						currentBall.AssemblyLinearVelocity = Vector3.zero
-						currentBall.AssemblyAngularVelocity = Vector3.zero
-					end
-
-					rootPart.CFrame = savedCFrame
-				end
-
-				State.autoGoalExecuting = false
-			end
+			performAutoGoalStep()
 		else
 			spamStealStep()
 		end
@@ -3125,6 +3173,9 @@ Bind(player.CharacterAdded, function()
 
 	State.enabled = false
 	State.forceUnanchorActive = false
+	State.autoGoalRunId += 1
+	State.autoGoalExecuting = false
+	State.stealBallEnabled = false
 	State.tpActive = false
 	State.tpReturnCFrame = nil
 	State.tpGoalActive = false
