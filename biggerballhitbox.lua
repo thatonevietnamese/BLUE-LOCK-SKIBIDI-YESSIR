@@ -47,6 +47,7 @@ local HotkeyButton
 local SavedPosition = Config.StartPosition
 
 local GuiConnections = {}
+local CharacterConnection = nil
 local PickupThread = nil
 
 local WaitingForHotkey = false
@@ -236,6 +237,21 @@ local function DestroyGUI()
 end
 
 --==================================================
+-- UNLOAD SCRIPT COMPLETELY
+--==================================================
+
+local function UnloadScript()
+    SetEnabled(false)
+
+    if CharacterConnection then
+        CharacterConnection:Disconnect()
+        CharacterConnection = nil
+    end
+
+    DestroyGUI()
+end
+
+--==================================================
 -- CREATE GUI
 --==================================================
 
@@ -295,7 +311,7 @@ local function CreateGUI()
     local Title = Instance.new("TextLabel")
 
     Title.Name = "Title"
-    Title.Size = UDim2.new(1, -20, 0, 25)
+    Title.Size = UDim2.new(1, -45, 0, 25)
     Title.Position = UDim2.fromOffset(10, 5)
 
     Title.BackgroundTransparency = 1
@@ -309,6 +325,35 @@ local function CreateGUI()
         Enum.TextXAlignment.Left
 
     Title.Parent = Frame
+
+    --==============================================
+    -- CLOSE / UNLOAD BUTTON
+    --==============================================
+
+    local CloseButton = Instance.new("TextButton")
+
+    CloseButton.Name = "Close"
+    CloseButton.Size = UDim2.fromOffset(20, 20)
+    CloseButton.Position = UDim2.new(1, -25, 0, 7)
+
+    CloseButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    CloseButton.BorderSizePixel = 0
+
+    CloseButton.Text = "X"
+    CloseButton.TextColor3 = Color3.new(1, 1, 1)
+    CloseButton.TextSize = 12
+    CloseButton.Font = Enum.Font.GothamBold
+
+    CloseButton.Parent = Frame
+
+    local CloseCorner = Instance.new("UICorner")
+    CloseCorner.CornerRadius = UDim.new(0, 5)
+    CloseCorner.Parent = CloseButton
+
+    table.insert(
+        GuiConnections,
+        CloseButton.MouseButton1Click:Connect(UnloadScript)
+    )
 
     --==============================================
     -- TOGGLE BUTTON
@@ -505,8 +550,6 @@ end
 --==================================================
 -- CHARACTER RESET
 --==================================================
-
-local CharacterConnection
 
 CharacterConnection =
     LocalPlayer.CharacterAdded:Connect(
