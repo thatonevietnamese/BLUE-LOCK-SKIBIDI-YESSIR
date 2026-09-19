@@ -38,20 +38,35 @@ local VERSION = "3.0.0"
 
 do
     local old = ENV[KEY]
-    if type(old) == "table" then
-        if old.VERSION == VERSION and type(old.ToggleUI) == "function" then
-            pcall(old.ToggleUI)
+
+    -- Nếu đúng cùng version đã chạy trước đó:
+    -- chỉ toggle UI, tuyệt đối không tạo thêm GUI / watcher / connection.
+    if type(old) == "table"
+        and old.VERSION == VERSION
+        and type(old.ToggleUI) == "function"
+    then
+        pcall(old.ToggleUI)
+        return
+    end
+
+    -- Fallback: nếu marker trong getgenv bị mất nhưng GUI cùng version
+    -- vẫn còn trong PlayerGui, chỉ toggle GUI hiện tại rồi dừng.
+    local existingGui = PlayerGui:FindFirstChild("BallControllerMoreMod")
+    if existingGui then
+        local existingVersion = existingGui:GetAttribute("MoreModVersion")
+        if existingVersion == VERSION then
+            existingGui.Enabled = not existingGui.Enabled
             return
         end
+    end
 
-        -- Khác version / bản cũ: teardown hoàn toàn trước khi tạo bản mới.
-        if type(old.Cleanup) == "function" then
-            pcall(old.Cleanup)
-        end
+    -- Khác version / bản cũ: teardown hoàn toàn trước khi tạo bản mới.
+    if type(old) == "table" and type(old.Cleanup) == "function" then
+        pcall(old.Cleanup)
+    end
 
-        if ENV[KEY] == old then
-            ENV[KEY] = nil
-        end
+    if ENV[KEY] == old then
+        ENV[KEY] = nil
     end
 end
 
