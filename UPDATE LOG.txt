@@ -1,7 +1,7 @@
---Ver:01.02.05--
+--Ver:01.02.06--
 THANKS tryhard for the actual comment=))
 you are the first one to actually suggest something
-AND NOW I'LL MENTION I ADD
+AND NOW I'LL MENTION WHAT I ADD
 1.steall ball
 -I add different steal for some character(but well i'm to use the check cooldown thingy and will add later on to prevent spam input)
 2.tp goal
