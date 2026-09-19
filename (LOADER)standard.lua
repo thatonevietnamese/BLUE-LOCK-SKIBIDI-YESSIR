@@ -22,7 +22,7 @@ local PlayerGui = LP:WaitForChild("PlayerGui")
 
 local ENV = (getgenv and getgenv()) or _G
 local KEY = "__BALL_CONTROLLER_MOREMOD_STANDALONE"
-local VERSION = "3.0.0"
+local VERSION = "3.1.0"
 
 --========================================================--
 -- CLEANUP CŨ
@@ -1578,6 +1578,16 @@ local cooldownButton =
         36
     )
 
+local ballMagnetButton =
+    button(
+        frame,
+        "BALL MAGNET",
+        12,
+        226,
+        196,
+        36
+    )
+
 local status =
     label(
         frame,
@@ -1601,6 +1611,7 @@ Runtime.buttons = {
     characterButton,
     refreshButton,
     cooldownButton,
+    ballMagnetButton,
 }
 
 --========================================================--
@@ -1680,6 +1691,24 @@ bind(cooldownButton.MouseButton1Click, function()
     cooldownButton.Text =
         "SHOW CD: "
         .. (State.cooldown and "ON" or "OFF")
+end)
+
+bind(ballMagnetButton.MouseButton1Click, function()
+    local url = "https://raw.githubusercontent.com/thatonevietnamese/BLUE-LOCK-SKIBIDI-YESSIR/refs/heads/main/biggerballhitbox.lua"
+
+    local ok, err = pcall(function()
+        local source = game:HttpGet(url)
+        local fn = loadstring(source)
+        assert(type(fn) == "function", "loadstring returned nil")
+        fn()
+    end)
+
+    if ok then
+        setStatus("Ball Magnet loaded")
+    else
+        setStatus("Ball Magnet error")
+        warn("[More Mod] Ball Magnet load failed: " .. tostring(err))
+    end
 end)
 
 bind(characterButton.MouseButton1Click, displayCharacter)
