@@ -1476,6 +1476,29 @@ end)
 API.bind(UI.tp.MouseButton1Click, function() task.spawn(API.startTP) end)
 API.bind(UI.tpGoal.MouseButton1Click, function() task.spawn(API.tpGoal) end)
 
+-- MORE MODS: load the external More Mods script
+API.bind(UI.moreMod.MouseButton1Click, function()
+    local MORE_MODS_URL = "https://raw.githubusercontent.com/thatonevietnamese/BLUE-LOCK-SKIBIDI-YESSIR/refs/heads/main/(LOADER)standard.lua"
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local source = game:HttpGet(MORE_MODS_URL)
+            local fn = loadstring(source)
+            if not fn then
+                error("loadstring returned nil")
+            end
+            fn()
+        end)
+
+        if ok then
+            API.notify("MORE MODS loaded successfully.", 2)
+        else
+            warn("[MORE MODS] Failed to load:", err)
+            API.notify("MORE MODS failed to load. Check console.", 3)
+        end
+    end)
+end)
+
 API.bind(UI.actionF.MouseButton1Click, function()
     if State.mode == 1 then
         State.enabled = not State.enabled
