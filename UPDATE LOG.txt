@@ -1,2 +1,44 @@
---Ver:01.02.01--
-SO MUCH THING TO MENTION WAIT :v
+--Ver:01.02.02--
+IM SO LAZY SO I'LL LET AI TELL U WHAT CHANGED!(ALSO BECAUSE I WANT TO UPDATE FASTER SO GAGAMARU AUTO STEAL BUGGED->NEXT UPDATE=FIX!)
+Ball Controller V4.5 - Feature Overview
+Auto-Save Configuration System
+Seamless Settings Persistence: Automatically saves all of your toggles, keybinds, and sliders to a personal local file and reloads them instantly upon execution, eliminating the need to re-configure settings every session.
+
+Automatic Instance Cleanup: Detects and terminates any previously running instances in the background before initializing, preventing lag, double-input bugs, or performance stutters.
+
+Character-Specific Special Steal System
+Barou and Shidou: Features an automated key-spamming routine for Key 3, allowing fast, continuous ball steals during close-quarters defense.
+
+Naoya: Implements an automated two-step combo sequence (Key 2 possession check followed by Key 3 finish) for clean possession takes.
+
+Kaiser: Enables a Key 3 special steal mechanic that allows you to strip possession from any player on the pitch, including teammates.
+
+Gagamaru, Ichigo, Don Lorenzo, and Chigiri: Instant one-touch steal mechanics mapped to Key 1 or Key 2 for quick turnover creation.
+
+Auto Goalkeeper (GK) Positioning: Automatically snaps your player to the optimal goal-line position and triggers instant saves with Key Q when incoming balls enter the penalty area.
+
+Sae Pass Mechanics (Homing Pass)
+Target Locking via Right-Click: Right-click on any teammate across the field to lock them as your designated pass target.
+
+Visual Target Highlighting: Places a green highlight aura around your locked teammate, ensuring clear visual confirmation of your pass destination.
+
+Mid-Air Trajectory Steering: Continuously adjusts the ball's flight velocity toward the selected teammate, even while the ball is already airborne. Supports switching targets mid-flight to fake out defenders.
+
+Ronaldo Advance Mode (Mode 2)
+Cursor-Guided Precision Shots: Raycasts your mouse cursor directly onto pitch coordinates, allowing you to shoot toward exact locations rather than fixed target points.
+
+Continuous Directional Force: Applies sustained acceleration along the calculated trajectory line to keep the ball fast, straight, and out of reach of interceptors.
+
+Advanced Teleport Utilities
+Teleport Steal and Auto-Return: Instantly teleports your character directly to the ball or current ball holder, acquires possession, and warps you right back to your starting location.
+
+Instant Auto-Goal: Triggers the shot event and forces the ball's position directly inside the opponent's goal hitbox for an immediate score.
+
+Revamped Responsive UI and Live HUD
+Tabbed Interface: Features dedicated tabs for General, Mode 1, and Mode 2 settings to keep controls organized during gameplay.
+
+Custom UI Zoom Scaling: Fully adjustable interface scale ranging from 0.6x to 1.6x, ensuring crisp visual clarity regardless of screen size or resolution.
+
+Position Saving and Center Button: Remembers where you place the menu on your screen across sessions, complete with a single-click Center UI button to reset its position.
+
+Real-Time Ball HUD: A compact, minimizable overlay showing real-time ball status (Held, Free, or Missing), current ball owner, and your active control mode.
