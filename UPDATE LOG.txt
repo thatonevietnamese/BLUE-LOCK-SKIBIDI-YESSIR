@@ -1,5 +1,6 @@
---Ver:01.02.02--
-IM SO LAZY SO I'LL LET AI TELL U WHAT CHANGED!(ALSO BECAUSE I WANT TO UPDATE FASTER SO GAGAMARU AUTO STEAL BUGGED->NEXT UPDATE=FIX!)
+--Ver:01.02.03--
+IM SO LAZY SO I'LL LET A.I TELL U WHAT CHANGED!(ALSO BECAUSE I WANT TO UPDATE FASTER SO GAGAMARU AUTO STEAL BUGGED->NEXT UPDATE=FIX!)
+DAMN NO WAY A.I FORGOT TO MENTION THAT I ALSO MADE A MOBILE FRIENDLY SCRIPT BRUH STUPID MAN-_-, THE MOBILE SCRIPT I TRIED MY BEST NOT TO MAKE IT CONFUSING SO THAT ALL ENJOY THE UPDATE!!!
 Ball Controller V4.5 - Feature Overview
 Auto-Save Configuration System
 Seamless Settings Persistence: Automatically saves all of your toggles, keybinds, and sliders to a personal local file and reloads them instantly upon execution, eliminating the need to re-configure settings every session.
