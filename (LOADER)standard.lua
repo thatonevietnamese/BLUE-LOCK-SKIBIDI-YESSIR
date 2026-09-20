@@ -22,7 +22,7 @@ local PlayerGui = LP:WaitForChild("PlayerGui")
 
 local ENV = (getgenv and getgenv()) or _G
 local KEY = "__BALL_CONTROLLER_MOREMOD_STANDALONE"
-local VERSION = "3.1.0"
+local VERSION = "3.2.0"
 
 --========================================================--
 -- CLEANUP CŨ
@@ -170,9 +170,12 @@ local Cooldown = {
     list = nil,
     bars = {},
     connections = {},
+    connectedSources = {},
+    recentEvents = {},
     messageConn = nil,
     layoutConn = nil,
-    useMoveHookInstalled = false,
+    currentUseMove = nil,
+    handleUseMove = nil,
 }
 
 --========================================================--
@@ -361,6 +364,7 @@ local CameraShakeNames = {
 local CameraShakeCache = {}
 local CameraShakeWatcher = nil
 local CameraShakePlayerWatcher = nil
+local CameraShakePlayerScriptWatcher = nil
 
 local function cacheAndDestroyCameraShake(obj)
     if not obj or not obj.Parent or not CameraShakeNames[obj.Name] then
@@ -450,6 +454,8 @@ local function antiShake(on)
     CameraShakeWatcher = nil
     disconnect(CameraShakePlayerWatcher)
     CameraShakePlayerWatcher = nil
+    disconnect(CameraShakePlayerScriptWatcher)
+    CameraShakePlayerScriptWatcher = nil
 
     if not on then
         restoreCameraShake()
@@ -480,13 +486,31 @@ local function antiShake(on)
         end
     end
 
-    local playerScripts = LP:FindFirstChild("PlayerScripts")
-    if playerScripts then
+    local function watchPlayerScripts(playerScripts)
+        disconnect(CameraShakePlayerScriptWatcher)
+        CameraShakePlayerScriptWatcher = nil
+
+        if not playerScripts then
+            return
+        end
+
         local cameraShake = playerScripts:FindFirstChild("CameraShake")
         if cameraShake then
             cacheAndDestroyCameraShake(cameraShake)
         end
+
+        CameraShakePlayerScriptWatcher = playerScripts.ChildAdded:Connect(function(obj)
+            if State.antiShake and obj.Name == "CameraShake" then
+                task.defer(function()
+                    if State.antiShake and obj.Parent then
+                        cacheAndDestroyCameraShake(obj)
+                    end
+                end)
+            end
+        end)
     end
+
+    watchPlayerScripts(LP:FindFirstChild("PlayerScripts"))
 
     -- Block recreation inside ReplicatedStorage.
     CameraShakeWatcher = ReplicatedStorage.DescendantAdded:Connect(function(obj)
@@ -503,9 +527,8 @@ local function antiShake(on)
     CameraShakePlayerWatcher = LP.ChildAdded:Connect(function(obj)
         if State.antiShake and obj.Name == "PlayerScripts" then
             task.defer(function()
-                local scriptObj = obj:FindFirstChild("CameraShake")
-                if scriptObj then
-                    cacheAndDestroyCameraShake(scriptObj)
+                if State.antiShake and obj.Parent then
+                    watchPlayerScripts(obj)
                 end
             end)
         end
@@ -528,10 +551,16 @@ local ScreenEffectNames = {
 local function removeScreenEffect(obj)
     if not obj or not obj.Parent then return end
 
-    if obj.Parent == PlayerGui and ScreenEffectNames[obj.Name] then
-        pcall(function()
-            obj:Destroy()
+    if ScreenEffectNames[obj.Name] then
+        local ok, insidePlayerGui = pcall(function()
+            return obj:IsDescendantOf(PlayerGui)
         end)
+
+        if ok and insidePlayerGui then
+            pcall(function()
+                obj:Destroy()
+            end)
+        end
     end
 end
 
@@ -544,15 +573,14 @@ local function antiBlur(on)
         return true
     end
 
-    for _, name in ipairs({"Blindness", "ScreenEffectsGUI", "BlackBars"}) do
-        local obj = PlayerGui:FindFirstChild(name)
-        if obj then
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if ScreenEffectNames[obj.Name] then
             safeDestroy(obj)
         end
     end
 
     FeatureConnections.antiBlur =
-        PlayerGui.ChildAdded:Connect(removeScreenEffect)
+        PlayerGui.DescendantAdded:Connect(removeScreenEffect)
 
     setStatus("SCREEN EFFECT CLEANUP ON")
     return true
@@ -1023,7 +1051,46 @@ local function destroyCooldownBar(entry)
     if not entry then return end
 
     safeDestroy(entry.label)
-    safeDestroy(entry.card)
+end
+
+local COOLDOWN_DEDUP_WINDOW = 0.12
+
+local function cooldownIdentifierKey(skillIdentifier)
+    local t = typeof(skillIdentifier)
+
+    if t == "Instance" then
+        local ok, fullName = pcall(function()
+            return skillIdentifier:GetFullName()
+        end)
+        return "instance:" .. (ok and fullName or skillIdentifier.Name)
+    end
+
+    if t == "table" then
+        local name = rawget(skillIdentifier, "Name")
+        if name ~= nil then
+            return "table:" .. tostring(name)
+        end
+    end
+
+    return t .. ":" .. tostring(skillIdentifier)
+end
+
+local function isDuplicateCooldown(skillIdentifier, duration)
+    local now = os.clock()
+    local key = cooldownIdentifierKey(skillIdentifier)
+        .. "|"
+        .. string.format("%.3f", tonumber(duration) or 0)
+
+    for oldKey, oldTime in pairs(Cooldown.recentEvents) do
+        if now - oldTime > 1 then
+            Cooldown.recentEvents[oldKey] = nil
+        end
+    end
+
+    local lastTime = Cooldown.recentEvents[key]
+    Cooldown.recentEvents[key] = now
+
+    return lastTime ~= nil and (now - lastTime) <= COOLDOWN_DEDUP_WINDOW
 end
 
 local function createCooldownBar(skillIdentifier, duration)
@@ -1042,6 +1109,13 @@ local function createCooldownBar(skillIdentifier, duration)
 
     local cdTime = tonumber(duration)
     if not cdTime or cdTime <= 0 then
+        return
+    end
+
+    -- Một cooldown có thể được phát hiện đồng thời từ:
+    -- RemoteEvent/BindableEvent và UseMove hook.
+    -- Chặn bản ghi giống nhau trong một cửa sổ rất ngắn để không tạo 2 bar.
+    if isDuplicateCooldown(skillIdentifier, cdTime) then
         return
     end
 
@@ -1108,9 +1182,31 @@ end
 
 local function disconnectCooldownEvents()
     disconnectList(Cooldown.connections)
+    table.clear(Cooldown.connectedSources)
 
     disconnect(Cooldown.messageConn)
     Cooldown.messageConn = nil
+end
+
+local function connectCooldownSource(source)
+    if not source or Cooldown.connectedSources[source] then
+        return false
+    end
+
+    local signal
+    if source:IsA("RemoteEvent") then
+        signal = source.OnClientEvent
+    elseif source:IsA("BindableEvent") then
+        signal = source.Event
+    else
+        return false
+    end
+
+    Cooldown.connectedSources[source] = true
+    Cooldown.connections[#Cooldown.connections + 1] =
+        signal:Connect(createCooldownBar)
+
+    return true
 end
 
 local function setupCooldownGui()
@@ -1211,34 +1307,24 @@ local function setupCooldownEvents()
         return
     end
 
+    table.clear(Cooldown.recentEvents)
     setupCooldownGui()
 
     -- Source 1: ReplicatedStorage.Events.CooldownMove
     local eventsFolder = ReplicatedStorage:FindFirstChild("Events")
     local cooldownMove = eventsFolder and eventsFolder:FindFirstChild("CooldownMove")
-    if cooldownMove and cooldownMove:IsA("RemoteEvent") then
-        Cooldown.connections[#Cooldown.connections + 1] =
-            cooldownMove.OnClientEvent:Connect(createCooldownBar)
-    end
+    connectCooldownSource(cooldownMove)
 
     -- Source 2: ReplicatedStorage.Events.UI
     local uiEvents = eventsFolder and eventsFolder:FindFirstChild("UI")
     if uiEvents then
-        local cooldownBind = uiEvents:FindFirstChild("CooldownBind")
-        local cooldownRemote = uiEvents:FindFirstChild("CooldownRemote")
-
-        if cooldownBind and cooldownBind:IsA("BindableEvent") then
-            Cooldown.connections[#Cooldown.connections + 1] =
-                cooldownBind.Event:Connect(createCooldownBar)
-        end
-
-        if cooldownRemote and cooldownRemote:IsA("RemoteEvent") then
-            Cooldown.connections[#Cooldown.connections + 1] =
-                cooldownRemote.OnClientEvent:Connect(createCooldownBar)
-        end
+        connectCooldownSource(uiEvents:FindFirstChild("CooldownBind"))
+        connectCooldownSource(uiEvents:FindFirstChild("CooldownRemote"))
     end
 
     -- Fallback: other games/versions may place the same remotes elsewhere.
+    -- connectCooldownSource() deduplicates the exact same Instance so a
+    -- recursively-found source cannot be connected twice.
     local bindable = findEventByNames(
         ReplicatedStorage,
         {"CooldownBind", "CooldownEvent", "Cooldown"},
@@ -1250,14 +1336,8 @@ local function setupCooldownEvents()
         {"RemoteEvent"}
     )
 
-    if bindable and not table.find(Cooldown.connections, bindable) then
-        Cooldown.connections[#Cooldown.connections + 1] =
-            bindable.Event:Connect(createCooldownBar)
-    end
-    if remote then
-        Cooldown.connections[#Cooldown.connections + 1] =
-            remote.OnClientEvent:Connect(createCooldownBar)
-    end
+    connectCooldownSource(bindable)
+    connectCooldownSource(remote)
 
     -- Awakening status.
     local messageRemote = findEventByNames(
@@ -1282,11 +1362,27 @@ local function setupCooldownEvents()
         end)
     end
 
-    -- Source 3: UseMove hook. Install only once, if the executor exposes
-    -- hookmetamethod/getnamecallmethod. This observes the returned cooldown.
+    -- Source 3: UseMove hook.
+    -- Hook này là hook toàn game, nên chỉ được cài MỘT lần trong ENV.
+    -- Runtime hiện tại chỉ đăng ký RemoteFunction đang dùng.
     local useMove = eventsFolder and eventsFolder:FindFirstChild("UseMove")
-    if useMove and useMove:IsA("RemoteFunction")
-        and not Cooldown.useMoveHookInstalled
+    Cooldown.currentUseMove =
+        useMove and useMove:IsA("RemoteFunction") and useMove or nil
+
+    local hookKey = "__BALL_CONTROLLER_COOLDOWN_USEMOVE_HOOK"
+    local hookState = ENV[hookKey]
+
+    if type(hookState) ~= "table" then
+        hookState = {
+            installed = false,
+            runtime = nil,
+        }
+        ENV[hookKey] = hookState
+    end
+
+    hookState.runtime = Cooldown
+
+    if not hookState.installed
         and type(hookmetamethod) == "function"
         and type(getnamecallmethod) == "function"
     then
@@ -1297,14 +1393,26 @@ local function setupCooldownEvents()
                 local args = {...}
 
                 local result = table.pack(oldNamecall(self, ...))
+                local runtime = hookState.runtime
 
-                if self == useMove
+                local isUseMove =
+                    runtime
+                    and runtime.enabled
+                    and (self == runtime.currentUseMove
+                        or (
+                            (not runtime.currentUseMove or not runtime.currentUseMove.Parent)
+                            and self.Name == "UseMove"
+                            and self:IsA("RemoteFunction")
+                        ))
                     and (method == "InvokeServer" or method == "invokeServer")
-                then
+
+                if isUseMove then
+                    runtime.currentUseMove = self
+
                     local moveId = args[1]
                     local cooldownTime = result[1]
-                    if cooldownTime then
-                        createCooldownBar(moveId, cooldownTime)
+                    if cooldownTime and runtime.handleUseMove then
+                        runtime.handleUseMove(moveId, cooldownTime)
                     end
                 end
 
@@ -1313,10 +1421,12 @@ local function setupCooldownEvents()
         end)
 
         if ok and oldNamecall then
-            Cooldown.useMoveHookInstalled = true
+            hookState.installed = true
         end
     end
 end
+
+Cooldown.handleUseMove = createCooldownBar
 
 local function setCooldown(on)
     Cooldown.enabled = on
@@ -1328,6 +1438,8 @@ local function setCooldown(on)
         setStatus("Show CD ON")
     else
         disconnectCooldownEvents()
+        Cooldown.currentUseMove = nil
+        table.clear(Cooldown.recentEvents)
 
         for _, entry in ipairs(Cooldown.bars) do
             destroyCooldownBar(entry)
@@ -1820,12 +1932,22 @@ local function Cleanup()
     CameraShakeWatcher = nil
     disconnect(CameraShakePlayerWatcher)
     CameraShakePlayerWatcher = nil
+    disconnect(CameraShakePlayerScriptWatcher)
+    CameraShakePlayerScriptWatcher = nil
 
     -- Cleanup bản cũ phải tắt hẳn Anti Screen Shake và trả object về trạng thái bình thường.
     State.antiShake = false
     restoreCameraShake()
 
     disconnectCooldownEvents()
+    Cooldown.currentUseMove = nil
+    Cooldown.handleUseMove = nil
+    table.clear(Cooldown.recentEvents)
+
+    local hookState = ENV["__BALL_CONTROLLER_COOLDOWN_USEMOVE_HOOK"]
+    if type(hookState) == "table" and hookState.runtime == Cooldown then
+        hookState.runtime = nil
+    end
 
     for _, entry in ipairs(Cooldown.bars) do
         destroyCooldownBar(entry)
