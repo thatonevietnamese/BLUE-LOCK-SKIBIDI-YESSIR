@@ -1,4 +1,5 @@
---Ver:01.02.07--
+--Ver:01.02.09--
 SO I FOUND A BUG WHICH AUTO STEAL NOT TURNING OFF EVEN THE SETTING "AUTO STEAL OFF" IS ON BUT I DON'T HAVE TIME TO FIX . I VERY APOLOGIZE :( next update fix
+Another bug found:which is show cooldown make two notification on steal,dive,request ball.i'll fix it tomorrow!
 1.steall ball
 -I add different steal for some character include kaiser(use for steal teammate tho),chirigi,etc.I add atleast 7 character but to lazy to include(but well i'm to use the check cooldown thingy and will add later on to prevent spam input)
