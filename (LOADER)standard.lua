@@ -1700,6 +1700,16 @@ local ballMagnetButton =
         36
     )
 
+local autoSelectTeamButton =
+    button(
+        frame,
+        "AUTO SELECT TEAM",
+        222,
+        226,
+        196,
+        36
+    )
+
 local status =
     label(
         frame,
@@ -1724,6 +1734,7 @@ Runtime.buttons = {
     refreshButton,
     cooldownButton,
     ballMagnetButton,
+    autoSelectTeamButton,
 }
 
 --========================================================--
@@ -1820,6 +1831,24 @@ bind(ballMagnetButton.MouseButton1Click, function()
     else
         setStatus("Ball Magnet error")
         warn("[More Mod] Ball Magnet load failed: " .. tostring(err))
+    end
+end)
+
+bind(autoSelectTeamButton.MouseButton1Click, function()
+    local url = "https://raw.githubusercontent.com/thatonevietnamese/BLUE-LOCK-SKIBIDI-YESSIR/refs/heads/main/select%20menu.lua"
+
+    local ok, err = pcall(function()
+        local source = game:HttpGet(url)
+        local fn = loadstring(source)
+        assert(type(fn) == "function", "loadstring returned nil")
+        fn()
+    end)
+
+    if ok then
+        setStatus("Auto Select Team loaded")
+    else
+        setStatus("Auto Select Team error")
+        warn("[More Mod] Auto Select Team load failed: " .. tostring(err))
     end
 end)
 
