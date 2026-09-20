@@ -18,6 +18,7 @@ local Lighting = game:GetService("Lighting")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local GuiService = game:GetService("GuiService")
 local HttpService = game:GetService("HttpService")
+local TextService = game:GetService("TextService")
 
 local LP = Players.LocalPlayer
 local PlayerGui = LP:WaitForChild("PlayerGui")
@@ -37,8 +38,8 @@ local CFG = {
     TP_TIME = 1.5,
 
     SHOOT_FORCE = 100,
-    SHOOT_FORCE_MIN = 100,
-    SHOOT_FORCE_MAX = 1000,
+    AUTO_GOAL_SHOOT_FORCE = 150,
+    AUTO_GOAL_SHOOT_INTERVAL = 0.06,
 
     GK_ROLES = {
         gk = true,
@@ -118,15 +119,14 @@ local State = {
     responsiveScale = 1,
     forceMobileUI = CFG.FORCE_MOBILE_UI,
 
-    shootMaxVelocity = CFG.SHOOT_FORCE,
-    shootVelocityLimitEnabled = false,
+    autoGoalTarget = "AutoGoal",
     autoStealOffOnGet = true,
 
     leftMouseHeld = false,
     rightMouseHeld = false,
     lastSteal = 0,
 
-    special = { active = false, target = nil, step = 1, nextAt = 0, character = "" },
+    special = { active = false, target = nil, step = 1, nextAt = 0, startedAt = 0, character = "" },
 }
 
 local Tracker = { state = "UNKNOWN", holder = nil, ball = nil, last = 0, queued = false }
@@ -188,8 +188,7 @@ do
     if type(c.autoStealOffOnGet) == "boolean" then State.autoStealOffOnGet = c.autoStealOffOnGet end
     if type(c.saeHighlightEnabled) == "boolean" then State.saeHighlightEnabled = c.saeHighlightEnabled end
     if type(c.tpDuration) == "number" then State.tpDuration = math.clamp(c.tpDuration, 0.1, 60) end
-    if type(c.shootMaxVelocity) == "number" then State.shootMaxVelocity = math.clamp(c.shootMaxVelocity, CFG.SHOOT_FORCE_MIN, CFG.SHOOT_FORCE_MAX) end
-    if type(c.shootVelocityLimitEnabled) == "boolean" then State.shootVelocityLimitEnabled = c.shootVelocityLimitEnabled end
+    if c.autoGoalTarget == "AutoGoal" or c.autoGoalTarget == "ScoreHitbox" then State.autoGoalTarget = c.autoGoalTarget end
     if type(c.controlKey) == "string" and Enum.KeyCode[c.controlKey] then State.controlKey = Enum.KeyCode[c.controlKey] end
     if type(c.mode1Speed) == "number" then Mode[1].speed = math.clamp(c.mode1Speed, CFG.MIN_SPEED, CFG.MAX_SPEED) end
     if type(c.mode2Speed) == "number" then Mode[2].speed = math.clamp(c.mode2Speed, CFG.MIN_SPEED, CFG.MAX_SPEED) end
@@ -209,8 +208,7 @@ local function saveConfig()
     Persist.data.autoStealOffOnGet = State.autoStealOffOnGet
     Persist.data.saeHighlightEnabled = State.saeHighlightEnabled
     Persist.data.tpDuration = State.tpDuration
-    Persist.data.shootMaxVelocity = math.clamp(tonumber(State.shootMaxVelocity) or CFG.SHOOT_FORCE_MIN, CFG.SHOOT_FORCE_MIN, CFG.SHOOT_FORCE_MAX)
-    Persist.data.shootVelocityLimitEnabled = State.shootVelocityLimitEnabled
+    Persist.data.autoGoalTarget = State.autoGoalTarget
     Persist.data.controlKey = State.controlKey and State.controlKey.Name or nil
     Persist.data.mode1Speed = Mode[1].speed
     Persist.data.mode2Speed = Mode[2].speed
@@ -352,27 +350,22 @@ end
 
 --========================================================--
 -- BALL TRACKER & REMOTE
---========================================================--
-
 do
-    local function matchPlayer(plr) return plr ~= nil and plr.Character ~= nil end
-    local function ballInCharacter(char)
-        if not char then return nil end
-        local ball = char:FindFirstChild(CFG.BALL_NAME, true)
+    local function playerModel(plr)
+        if not plr then return nil end
+        return workspace:FindFirstChild(plr.Name)
+    end
+
+    local function ballInPlayerModel(plr)
+        local model = playerModel(plr)
+        if not model then return nil end
+        local ball = model:FindFirstChild(CFG.BALL_NAME)
         return ball and ball:IsA("BasePart") and ball or nil
     end
 
     local function freeBall()
         local direct = workspace:FindFirstChild(CFG.BALL_NAME)
-        if direct and direct:IsA("BasePart") then return direct end
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("BasePart") and string.lower(obj.Name) == string.lower(CFG.BALL_NAME) then
-                if not Char.model or not obj:IsDescendantOf(Char.model) then
-                    return obj
-                end
-            end
-        end
-        return nil
+        return direct and direct:IsA("BasePart") and direct or nil
     end
 
     function API.rebuildBall(force)
@@ -380,23 +373,27 @@ do
         if not force and now - Tracker.last < CFG.CACHE_INTERVAL then
             return Tracker.state, Tracker.holder, Tracker.ball
         end
+
         Tracker.last = now
         Tracker.queued = false
-        Tracker.state = "UNKNOWN"; Tracker.holder = nil; Tracker.ball = nil
+        Tracker.state = "UNKNOWN"
+        Tracker.holder = nil
+        Tracker.ball = nil
 
         for _, plr in ipairs(Players:GetPlayers()) do
-            if matchPlayer(plr) then
-                local ball = ballInCharacter(plr.Character)
-                if ball then
-                    Tracker.state = "HELD"; Tracker.holder = plr; Tracker.ball = ball
-                    return "HELD", plr, ball
-                end
+            local ball = ballInPlayerModel(plr)
+            if ball then
+                Tracker.state = "HELD"
+                Tracker.holder = plr
+                Tracker.ball = ball
+                return "HELD", plr, ball
             end
         end
 
         local ball = freeBall()
         if ball then
-            Tracker.state = "FREE"; Tracker.ball = ball
+            Tracker.state = "FREE"
+            Tracker.ball = ball
             return "FREE", nil, ball
         end
 
@@ -407,24 +404,45 @@ do
     function API.queueBallRebuild()
         if Tracker.queued then return end
         Tracker.queued = true
-        task.defer(function() if Tracker.queued then API.rebuildBall(false) end end)
+        task.defer(function()
+            if Tracker.queued then API.rebuildBall(false) end
+        end)
     end
 
     function API.getBallState()
         local state, holder, ball = Tracker.state, Tracker.holder, Tracker.ball
+
         if state == "HELD" then
-            if not holder or not holder.Parent or not holder.Character then return API.rebuildBall(false) end
-            if not ball or not ball.Parent or not ball:IsDescendantOf(holder.Character) then return API.rebuildBall(false) end
-            return state, holder, ball
-        end
-        if state == "FREE" then
-            if ball and ball.Parent then return state, nil, ball end
+            local current = ballInPlayerModel(holder)
+            if holder and holder.Parent and current then
+                Tracker.ball = current
+                return "HELD", holder, current
+            end
             return API.rebuildBall(false)
         end
+
+        if state == "FREE" then
+            local direct = freeBall()
+            if direct then
+                Tracker.ball = direct
+                return "FREE", nil, direct
+            end
+            return API.rebuildBall(false)
+        end
+
         return API.rebuildBall(false)
     end
 
     function API.localHasBall()
+        local directMine = ballInPlayerModel(LP)
+        if directMine then
+            Tracker.state = "HELD"
+            Tracker.holder = LP
+            Tracker.ball = directMine
+            Tracker.last = os.clock()
+            return true
+        end
+
         local state, holder = API.getBallState()
         return state == "HELD" and holder == LP
     end
@@ -441,27 +459,41 @@ do
     function API.attachCharacter(plr, char)
         API.disconnectList(CharConnections[plr])
         local list = {}
+
         API.bindLocal(list, char.DescendantAdded, function(obj)
-            if obj.Name == CFG.BALL_NAME and obj:IsA("BasePart") then API.queueBallRebuild() end
+            if obj.Name == CFG.BALL_NAME and obj:IsA("BasePart") then
+                API.queueBallRebuild()
+            end
         end)
+
         API.bindLocal(list, char.DescendantRemoving, function(obj)
             if obj == Tracker.ball then API.queueBallRebuild() end
         end)
+
         API.bindLocal(list, char.AncestryChanged, function(_, parent)
             if parent == nil then API.queueBallRebuild() end
         end)
+
         CharConnections[plr] = list
     end
 
     function API.attachPlayer(plr)
         API.disconnectList(PlayerConnections[plr])
         local list = {}
-        if plr.Character then API.attachCharacter(plr, plr.Character) end
+
+        if plr.Character then
+            API.attachCharacter(plr, plr.Character)
+        end
+
         API.bindLocal(list, plr.CharacterAdded, function(char)
             API.attachCharacter(plr, char)
             API.queueBallRebuild()
         end)
-        API.bindLocal(list, plr.CharacterRemoving, function() API.queueBallRebuild() end)
+
+        API.bindLocal(list, plr.CharacterRemoving, function()
+            API.queueBallRebuild()
+        end)
+
         PlayerConnections[plr] = list
     end
 end
@@ -486,16 +518,15 @@ do
             return false
         end
         if typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then return false end
-        local gameForce = math.clamp(tonumber(force) or CFG.SHOOT_FORCE, CFG.MIN_SPEED, CFG.MAX_SPEED)
-        local shootForce = gameForce
+        local shootForce = math.clamp(
+            tonumber(force) or CFG.SHOOT_FORCE,
+            CFG.MIN_SPEED,
+            CFG.MAX_SPEED
+        )
 
-        if State.shootVelocityLimitEnabled then
-            local maxSetting = math.clamp(tonumber(State.shootMaxVelocity) or CFG.SHOOT_FORCE_MIN, CFG.SHOOT_FORCE_MIN, CFG.SHOOT_FORCE_MAX)
-            local bonus = math.max(0, maxSetting - CFG.SHOOT_FORCE_MIN)
-            shootForce = math.clamp(gameForce + bonus, CFG.MIN_SPEED, CFG.MAX_SPEED)
-        end
-
-        return pcall(function() remote:FireServer(direction.Unit, shootForce, third or false) end)
+        return pcall(function()
+            remote:FireServer(direction.Unit, shootForce, third or false)
+        end)
     end
     API.resolveShootRemote(true)
 end
@@ -630,8 +661,18 @@ do
         return nil
     end
 
+    function API.selectedGoal(homeSide)
+        local selected = State.autoGoalTarget == "ScoreHitbox" and "ScoreHitbox" or "AutoGoal"
+
+        if selected == "ScoreHitbox" then
+            return API.goalHitbox(homeSide) or API.autoGoalTarget(homeSide)
+        end
+
+        return API.autoGoalTarget(homeSide) or API.goalHitbox(homeSide)
+    end
+
     function API.opponentGoal()
-        return API.autoGoalTarget(not API.isHome())
+        return API.selectedGoal(not API.isHome())
     end
 
     function API.inGoal(pos, goal)
@@ -650,12 +691,11 @@ do
         barou = { canSlide = true, canSlideTeammate = true, special = { name = "BAROU 3", key = Enum.KeyCode.Three, mode = "OPPONENT", repeatHeld = true, interval = 0.14, offset = Vector3.new(0, 5.5, 0) } },
         shidou = { canSlide = true, canSlideTeammate = false, special = { name = "SHIDOU 3", key = Enum.KeyCode.Three, mode = "OPPONENT", repeatHeld = true, interval = 0.16, offset = Vector3.new(0, 5.5, 0) } },
         naoya = { canSlide = true, canSlideTeammate = false, special = { name = "NAOYA 2 -> 3", mode = "OPPONENT", interval = 0.16, offset = Vector3.new(0, 5.5, 0), steps = { { key = Enum.KeyCode.Two, waitPossession = true }, { key = Enum.KeyCode.Three, finish = true } } } },
-        kaiser = { canSlide = true, canSlideTeammate = false, special = { name = "KAISER 3", key = Enum.KeyCode.Three, mode = "ANY", allowTeammate = true, repeatHeld = true, interval = 0.16, offset = Vector3.new(0, 5.5, 0) } },
+        kaiser = { canSlide = true, canSlideTeammate = false, special = { name = "KAISER 3", key = Enum.KeyCode.Three, mode = "TEAMMATE", repeatHeld = true, interval = 0.16, offset = Vector3.new(0, 5.5, 0) } },
         gagamaru = { canSlide = true, canSlideTeammate = false, special = { name = "GAGAMARU 3", key = Enum.KeyCode.Three, mode = "OPPONENT", oneShot = true, interval = 0.18, offset = Vector3.new(0, 5.5, 0) } },
         ichigo = { canSlide = true, canSlideTeammate = false, special = { name = "ICHIGO 1", key = Enum.KeyCode.One, mode = "OPPONENT", oneShot = true, interval = 0.18, offset = Vector3.new(0, 5.5, 0) } },
         donlorenzo = { canSlide = true, canSlideTeammate = false, special = { name = "DON LORENZO 2", key = Enum.KeyCode.Two, mode = "OPPONENT", oneShot = true, interval = 0.18, offset = Vector3.new(0, 5.5, 0) } },
         chigiri = { canSlide = true, canSlideTeammate = false, special = { name = "CHIGIRI 1", key = Enum.KeyCode.One, mode = "OPPONENT", oneShot = true, interval = 0.16, offset = Vector3.new(0, 5.5, 0) } },
-        chirigi = { canSlide = true, canSlideTeammate = false, special = { name = "CHIGIRI 1", key = Enum.KeyCode.One, mode = "OPPONENT", oneShot = true, interval = 0.16, offset = Vector3.new(0, 5.5, 0) } },
     }
 
     function API.ability()
@@ -667,6 +707,7 @@ do
         State.special.target = nil
         State.special.step = 1
         State.special.nextAt = 0
+        State.special.startedAt = 0
         State.special.character = ""
     end
 
@@ -700,64 +741,125 @@ do
     function API.specialSteal()
         local ability = API.ability()
         local special = ability.special
-        if not special then API.resetSpecial(); return false end
+
+        if not special then
+            API.resetSpecial()
+            return false
+        end
 
         local charName = API.characterName()
-        if State.special.active and State.special.character ~= charName then API.resetSpecial() end
+        if State.special.active and State.special.character ~= charName then
+            API.resetSpecial()
+        end
 
         local now = os.clock()
+
         if not State.special.active then
             local target = targetForSpecial(special)
             if not target then return false end
+
             State.special.active = true
             State.special.target = target
             State.special.step = 1
             State.special.nextAt = now
+            State.special.startedAt = now
             State.special.character = charName
+        elseif State.special.startedAt > 0 and now - State.special.startedAt > 0.9 then
+            API.resetSpecial()
+            return false
         end
 
         local target = State.special.target
-        if not target or not target.Parent then API.resetSpecial(); return false end
+        if not target or not target.Parent then
+            API.resetSpecial()
+            return false
+        end
+
         local root = API.playerRoot(target)
-        if not root then API.resetSpecial(); return false end
+        if not root then
+            API.resetSpecial()
+            return false
+        end
 
         if special.steps then
             local step = special.steps[State.special.step]
-            if not step then API.resetSpecial(); return false end
+            if not step then
+                API.resetSpecial()
+                return false
+            end
+
             if step.waitPossession then
                 if not API.localHasBall() then
-                    if not specialStillValid(target) then API.resetSpecial(); return false end
+                    if not specialStillValid(target) then
+                        API.resetSpecial()
+                        return false
+                    end
                     return true
                 end
+
                 State.special.step += 1
                 step = special.steps[State.special.step]
-                if not step then API.resetSpecial(); return true end
+
+                if not step then
+                    API.resetSpecial()
+                    return true
+                end
             end
-            if now < State.special.nextAt then return true end
-            if not specialStillValid(target) and not API.localHasBall() then API.resetSpecial(); return false end
+
+            -- Cooldown window: let normal E fallback run instead of blocking Auto Steal.
+            if now < State.special.nextAt then
+                return false
+            end
+
+            if not specialStillValid(target) and not API.localHasBall() then
+                API.resetSpecial()
+                return false
+            end
+
             local used = tpUse(target, step.key, step.offset or special.offset)
-            if not used then API.resetSpecial(); return false end
+            if not used then
+                API.resetSpecial()
+                return false
+            end
+
             State.special.nextAt = now + (step.interval or special.interval or CFG.SPECIAL_INTERVAL)
-            if step.finish then API.resetSpecial() end
+
+            if step.finish then
+                API.resetSpecial()
+            end
+
             return true
         end
 
-        if now < State.special.nextAt then return true end
-        if not special.oneShot and not specialStillValid(target) then API.resetSpecial(); return false end
+        if now < State.special.nextAt then
+            return false
+        end
+
+        if not special.oneShot and not specialStillValid(target) then
+            API.resetSpecial()
+            return false
+        end
+
         local used = tpUse(target, special.key, special.offset)
-        if not used then API.resetSpecial(); return false end
+        if not used then
+            API.resetSpecial()
+            return false
+        end
 
         if special.oneShot then
             API.resetSpecial()
         else
             State.special.nextAt = now + (special.interval or CFG.SPECIAL_INTERVAL)
         end
+
         return true
     end
 
     function API.normalStealTarget()
         local ability = API.ability()
         if not ability.canSlide then return nil end
+
+        API.rebuildBall(false)
         local state, holder, ball = Tracker.state, Tracker.holder, Tracker.ball
         if state == "HELD" and holder then
             if holder == LP then return nil end
@@ -777,6 +879,17 @@ do
                 end)
             end)
             if ok then return true end
+        end
+        return false
+    end
+
+    local function tryWeldBall(ball)
+        if not ball or not ball.Parent then return false end
+        local event = ball:FindFirstChild("WeldBall")
+        if event and event:IsA("RemoteEvent") then
+            return pcall(function()
+                event:FireServer()
+            end)
         end
         return false
     end
@@ -802,6 +915,11 @@ do
         end
 
         Char.root.CFrame = CFrame.new(target.Position + Vector3.new(0, CFG.STEAL_DISTANCE, 0))
+
+        if target:IsA("BasePart") and target.Name == CFG.BALL_NAME then
+            tryWeldBall(target)
+        end
+
         API.sendKey(Enum.KeyCode.E)
     end
 end
@@ -1077,7 +1195,7 @@ do
 
     -- MAIN FRAME
     UI.main = Instance.new("Frame")
-    UI.main.Size = UDim2.fromOffset(350, 445)
+    UI.main.Size = UDim2.fromOffset(350, 468)
     UI.main.Position = UDim2.fromOffset(25, 220)
     UI.main.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
     UI.main.BorderSizePixel = 0
@@ -1112,8 +1230,9 @@ do
     UI.tpTime = box(UI.main, State.tpDuration, 100, 310, 70, 36)
     UI.moreMod = button(UI.main, "MORE MODS", 180, 310, 160, 36)
 
-    UI.info = label(UI.main, "F = action theo mode.\nMode 1: camera control.\nMode 2: Ronaldo kick.\nTP Return/GK = follow ball.", 10, 350, 330, 75, 11)
+    UI.info = label(UI.main, "Mobile: use F ACTION for camera control.\nSTEAL BALL / AUTO GOAL run automatically.", 10, 350, 330, 45, 11)
     UI.info.TextWrapped = true
+    UI.manual = button(UI.main, "USER MANUAL", 10, 408, 330, 36)
 
     -- FLOATING BUTTONS (NÚT BẬT TẮT UI VÀ F ACTION ĐƯỢC ĐẶT Ở GÓC PHẢI DƯỚI CÙNG)
     UI.restore = button(gui, "⚽", 0, 0, 48, 48)
@@ -1195,7 +1314,9 @@ do
     content.BackgroundTransparency = 1
     content.BorderSizePixel = 0
     content.ScrollBarThickness = 3
-    content.CanvasSize = UDim2.fromOffset(0, 330)
+    content.ScrollingEnabled = true
+    content.ScrollingDirection = Enum.ScrollingDirection.Y
+    content.CanvasSize = UDim2.fromOffset(0, 420)
     content.Parent = UI.settingsFrame
     UI.settingsContent = content
 
@@ -1219,14 +1340,13 @@ do
     UI.general.autoGoalLabel = label(content, "AUTO GOAL", 10, 200, 110, 25, 12)
     UI.general.autoGoal = button(content, "OFF", 145, 196, 95, 32)
 
+    UI.general.goalTargetLabel = label(content, "GOAL TARGET", 10, 240, 110, 25, 11)
+    UI.general.goalTarget = button(content, "AUTOGOAL", 145, 236, 95, 32)
+
     UI.general.saeHighlightLabel = label(content, "SAE HIGHLIGHT", 255, 40, 135, 25, 12)
     UI.general.saeHighlight = button(content, "ON", 380, 36, 100, 32)
 
-    UI.general.shootVelocityLabel = label(content, "SHOOT FORCE MAX", 255, 80, 135, 25, 11)
-    UI.general.shootVelocity = box(content, State.shootMaxVelocity, 380, 76, 100, 32)
-    UI.general.shootVelocityToggle = button(content, "OFF", 380, 114, 100, 28)
-
-    UI.general.hint = label(content, "Auto Goal: steal -> shoot -> TP to AutoGoal.\nShoot Force Max ON: game force + (Max - 100).", 255, 150, 225, 105, 10)
+    UI.general.hint = label(content, "Auto Goal: steal -> shoot -> TP.\nTarget: AutoGoal or ScoreHitbox.", 255, 90, 225, 90, 10)
     UI.general.hint.TextWrapped = true
 
     -- MODE 1
@@ -1246,6 +1366,130 @@ do
     UI.m2.advance = button(content, "OFF", 140, 118, 120, 32)
     UI.m2.hint = label(content, "Ronaldo Advance: select point, press F to kick.", 10, 70, 460, 100, 11)
     UI.m2.hint.TextWrapped = true
+
+    UI.manualFrame = Instance.new("Frame")
+    UI.manualFrame.Size = UDim2.fromOffset(520, 430)
+    UI.manualFrame.Position = UDim2.fromOffset(390, 180)
+    UI.manualFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 27)
+    UI.manualFrame.BorderSizePixel = 0
+    UI.manualFrame.Visible = false
+    UI.manualFrame.ZIndex = 200
+    UI.manualFrame.Parent = gui
+    corner(UI.manualFrame, 12)
+
+    UI.manualTitle = label(UI.manualFrame, "USER MANUAL", 12, 8, 330, 30, 17)
+    UI.manualTitle.Font = Enum.Font.GothamBold
+    UI.manualTitle.ZIndex = 201
+
+    UI.manualClose = button(UI.manualFrame, "X", 480, 8, 28, 28)
+    UI.manualClose.ZIndex = 201
+
+    UI.manualScroll = Instance.new("ScrollingFrame")
+    UI.manualScroll.Size = UDim2.new(1, -20, 1, -52)
+    UI.manualScroll.Position = UDim2.fromOffset(10, 45)
+    UI.manualScroll.BackgroundColor3 = Color3.fromRGB(27, 27, 33)
+    UI.manualScroll.BackgroundTransparency = 0.1
+    UI.manualScroll.BorderSizePixel = 0
+    UI.manualScroll.ScrollBarThickness = 4
+    UI.manualScroll.ScrollingEnabled = true
+    UI.manualScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    UI.manualScroll.CanvasSize = UDim2.fromOffset(0, 900)
+    UI.manualScroll.ZIndex = 200
+    UI.manualScroll.Parent = UI.manualFrame
+    corner(UI.manualScroll, 8)
+
+    UI.manualContent = label(UI.manualScroll, "", 12, 10, 480, 850, 11)
+    UI.manualContent.TextWrapped = true
+    UI.manualContent.TextYAlignment = Enum.TextYAlignment.Top
+    UI.manualContent.ZIndex = 201
+
+    UI.manualContent.Text = [[
+BALL CONTROLLER — MOBILE USER MANUAL
+
+1. F ACTION
+Tap F ACTION to toggle Mode 1 ball control.
+While active, the camera follows the ball.
+
+2. STEAL BALL
+Tap STEAL BALL to enable or disable Auto Steal.
+The script checks the current ball holder and uses the matching steal behavior.
+Special steals can fall back to normal E steal when needed.
+
+3. AUTO STEAL OFF ON GET
+When ON, Auto Steal turns OFF as soon as your character is detected holding the ball.
+
+4. AUTO GOAL
+Enable AUTO GOAL to automatically:
+- get or steal the ball
+- shoot toward the selected goal
+- move the released ball to the selected target
+- continuously apply a 150 shot force while Auto Goal stays enabled
+
+5. GOAL TARGET
+In Settings > General, tap GOAL TARGET to switch between:
+- AUTOGOAL
+- SCOREHITBOX
+
+This target is used by TP GOAL and AUTO GOAL.
+
+6. TP RETURN
+TP RETURN moves you toward the current ball or ball holder.
+
+7. BALL STATUS
+BALL STATUS shows:
+- HELD BY a player
+- FREE
+- MISSING
+
+8. SETTINGS
+General:
+- Control Key
+- Anchor
+- Auto Steal Off On Get
+- TP Return Time
+- Auto Goal
+- Goal Target
+- SAE Highlight
+
+Mode 1:
+- Ball control speed
+
+Mobile mode keeps PC-only controls hidden.
+
+9. UI
+Tap the ⚽ button to restore the main panel.
+Drag the title bar with touch to reposition the panel.
+USER MANUAL opens this guide.
+
+10. NOTES
+ShootBall Max has been removed from the mobile build.
+Auto Goal uses the selected goal target.
+]]
+
+    local function refreshManualCanvas()
+        if not UI.manualScroll.Parent or not UI.manualContent.Parent then return end
+
+        local width = math.max(180, UI.manualScroll.AbsoluteSize.X - 24)
+        local ok, bounds = pcall(function()
+            return TextService:GetTextSize(
+                UI.manualContent.Text or "",
+                UI.manualContent.TextSize,
+                UI.manualContent.Font,
+                Vector2.new(width, 100000)
+            )
+        end)
+
+        local height = ok and bounds.Y or 900
+        height = math.max(120, height + 18)
+
+        UI.manualContent.Size = UDim2.fromOffset(width, height)
+        UI.manualScroll.CanvasSize = UDim2.fromOffset(
+            0,
+            math.max(height + 12, UI.manualScroll.AbsoluteWindowSize.Y + 1)
+        )
+    end
+
+    UI.manualRefresh = refreshManualCanvas
 
     UI.settingsReady = true
     UI.ready = true
@@ -1283,6 +1527,22 @@ function API.syncSettingsVisibility()
     end
 
     local generalVisible = (activeTab == 1)
+
+    if mobile then
+        UI.general.keyLabel.Position = UDim2.fromOffset(10, 40)
+        UI.general.key.Position = UDim2.fromOffset(145, 36)
+        UI.general.anchorLabel.Position = UDim2.fromOffset(10, 80)
+        UI.general.anchor.Position = UDim2.fromOffset(145, 76)
+        UI.general.autoStealLabel.Position = UDim2.fromOffset(10, 120)
+        UI.general.autoSteal.Position = UDim2.fromOffset(145, 116)
+        UI.general.tpLabel.Position = UDim2.fromOffset(10, 160)
+        UI.general.tp.Position = UDim2.fromOffset(145, 156)
+        UI.general.autoGoalLabel.Position = UDim2.fromOffset(10, 200)
+        UI.general.autoGoal.Position = UDim2.fromOffset(145, 196)
+        UI.general.goalTargetLabel.Position = UDim2.fromOffset(10, 240)
+        UI.general.goalTarget.Position = UDim2.fromOffset(145, 236)
+    end
+
     UI.general.title.Visible = generalVisible
     UI.general.keyLabel.Visible = generalVisible
     UI.general.key.Visible = generalVisible
@@ -1294,11 +1554,10 @@ function API.syncSettingsVisibility()
     UI.general.tp.Visible = generalVisible
     UI.general.autoGoalLabel.Visible = generalVisible
     UI.general.autoGoal.Visible = generalVisible
-    UI.general.saeHighlightLabel.Visible = generalVisible
-    UI.general.saeHighlight.Visible = generalVisible
-    UI.general.shootVelocityLabel.Visible = generalVisible
-    UI.general.shootVelocity.Visible = generalVisible
-    UI.general.shootVelocityToggle.Visible = generalVisible
+    UI.general.goalTargetLabel.Visible = generalVisible
+    UI.general.goalTarget.Visible = generalVisible
+    UI.general.saeHighlightLabel.Visible = generalVisible and not mobile
+    UI.general.saeHighlight.Visible = generalVisible and not mobile
     UI.general.hint.Visible = generalVisible and not mobile
 
     local mode1Visible = (activeTab == 2)
@@ -1306,7 +1565,7 @@ function API.syncSettingsVisibility()
     UI.m1.speed.Visible = mode1Visible
     UI.m1.advanceLabel.Visible = mode1Visible and not mobile
     UI.m1.advance.Visible = mode1Visible and not mobile
-    UI.m1.hint.Visible = mode1Visible
+    UI.m1.hint.Visible = mode1Visible and not mobile
 
     local mode2Visible = (activeTab == 3) and not mobile
     for _, obj in pairs(UI.m2) do
@@ -1323,6 +1582,41 @@ function API.applyResponsiveUI()
     local mobile = API.isMobileUI()
 
     if mobile then
+        UI.main.Size = UDim2.fromOffset(350, 468)
+        UI.main.Position = UDim2.fromOffset(
+            math.max(5, (vp.X - 350) / 2),
+            math.max(15, (vp.Y - 468) / 2)
+        )
+
+        UI.statusPanel.Size = UDim2.fromOffset(245, 125)
+        UI.statusPanel.Position = UDim2.fromOffset(
+            math.max(10, (vp.X - 245) / 2),
+            math.max(60, (vp.Y - 125) / 2)
+        )
+        UI.statusPanel.Visible = false
+
+        local settingsWidth = math.min(340, math.max(300, vp.X - 20))
+        local settingsHeight = math.min(390, math.max(330, vp.Y - 80))
+        UI.settingsFrame.Size = UDim2.fromOffset(settingsWidth, settingsHeight)
+        UI.settingsFrame.Position = UDim2.fromOffset(
+            math.max(10, (vp.X - settingsWidth) / 2),
+            math.max(50, (vp.Y - settingsHeight) / 2)
+        )
+
+        local manualWidth = math.min(340, math.max(300, vp.X - 20))
+        local manualHeight = math.min(430, math.max(320, vp.Y - 90))
+        UI.manualFrame.Size = UDim2.fromOffset(manualWidth, manualHeight)
+        UI.manualFrame.Position = UDim2.fromOffset(
+            math.max(10, (vp.X - manualWidth) / 2),
+            math.max(40, (vp.Y - manualHeight) / 2)
+        )
+        UI.manualClose.Position = UDim2.new(1, -38, 0, 8)
+
+        UI.settingsZoomOut.Position = UDim2.fromOffset(settingsWidth - 80, 8)
+        UI.settingsZoomIn.Position = UDim2.fromOffset(settingsWidth - 52, 8)
+        UI.closeSettings.Position = UDim2.fromOffset(settingsWidth - 30, 8)
+        UI.settingsTitle.Size = UDim2.fromOffset(math.max(180, settingsWidth - 95), 32)
+
         if State.mode ~= 1 then
             State.mode = 1
             State.enabled = false
@@ -1354,6 +1648,10 @@ function API.applyResponsiveUI()
     if UI.settingsReady then
         API.syncSettingsVisibility()
     end
+
+    if UI.manualRefresh then
+        task.defer(UI.manualRefresh)
+    end
 end
 
 function API.updateSettings()
@@ -1364,9 +1662,8 @@ function API.updateSettings()
     UI.general.autoSteal.Text = State.autoStealOffOnGet and "ON" or "OFF"
     UI.general.tp.Text = tostring(State.tpDuration)
     UI.general.autoGoal.Text = State.autoGoal and "ON" or "OFF"
+    UI.general.goalTarget.Text = State.autoGoalTarget == "ScoreHitbox" and "SCOREHITBOX" or "AUTOGOAL"
     UI.general.saeHighlight.Text = State.saeHighlightEnabled and "ON" or "OFF"
-    UI.general.shootVelocity.Text = tostring(State.shootMaxVelocity)
-    UI.general.shootVelocityToggle.Text = State.shootVelocityLimitEnabled and "ON" or "OFF"
 
     UI.m1.speed.Text = tostring(Mode[1].speed)
     UI.m1.advance.Text = State.advance and "ON" or "OFF"
@@ -1392,6 +1689,30 @@ function API.updateUI()
     UI.status.Text = State.enabled and "Status: ACTIVE" or (State.autoGoal and "Status: AUTO GOAL" or "Status: READY")
 end
 
+function API.scaleUI(value)
+    value = math.clamp(
+        math.floor((tonumber(value) or State.uiScale or 1) * 100 + 0.5) / 100,
+        CFG.ZOOM_MIN,
+        CFG.ZOOM_MAX
+    )
+
+    State.uiScale = value
+    saveConfig()
+
+    if UI.mainScale then UI.mainScale.Scale = value end
+    if UI.settingsScale then UI.settingsScale.Scale = value end
+    if UI.statusScale then UI.statusScale.Scale = value end
+
+    task.defer(function()
+        API.clampUI(UI.main)
+        API.clampUI(UI.settingsFrame)
+        API.clampUI(UI.statusPanel)
+        API.clampUI(UI.manualFrame)
+        API.clampUI(UI.restore)
+        API.clampUI(UI.actionF)
+    end)
+end
+
 --========================================================--
 -- BINDINGS & DRAG IMPLEMENTATION
 --========================================================--
@@ -1402,10 +1723,33 @@ API.makeDraggable(UI.statusPanel, UI.statusTitle)
 API.makeDraggable(UI.actionF, UI.actionF)
 API.makeDraggable(UI.restore, UI.restore)
 
+API.bind(UI.zoomOut.MouseButton1Click, function()
+    API.scaleUI(State.uiScale - CFG.ZOOM_STEP)
+end)
+
+API.bind(UI.zoomIn.MouseButton1Click, function()
+    API.scaleUI(State.uiScale + CFG.ZOOM_STEP)
+end)
+
+API.bind(UI.settingsZoomOut.MouseButton1Click, function()
+    API.scaleUI(State.uiScale - CFG.ZOOM_STEP)
+end)
+
+API.bind(UI.settingsZoomIn.MouseButton1Click, function()
+    API.scaleUI(State.uiScale + CFG.ZOOM_STEP)
+end)
+
+API.bind(UI.force.MouseButton1Click, function()
+    API.forceUnanchor()
+    API.updateUI()
+end)
+
 API.bind(UI.minimize.MouseButton1Click, function()
     State.minimized = true
     UI.main.Visible = false
     UI.settingsFrame.Visible = false
+    UI.manualFrame.Visible = false
+    UI.statusPanel.Visible = false
     UI.restore.Visible = true
 end)
 
@@ -1413,11 +1757,39 @@ API.bind(UI.restore.MouseButton1Click, function()
     State.minimized = false
     UI.main.Visible = true
     UI.restore.Visible = true
+    UI.manualFrame.Visible = false
+end)
+
+API.bind(UI.statusToggle.MouseButton1Click, function()
+    UI.statusPanel.Visible = not UI.statusPanel.Visible
+
+    if API.isMobileUI() then
+        UI.main.Visible = not UI.statusPanel.Visible and not State.minimized
+    end
+
+    API.updateUI()
+end)
+
+API.bind(UI.statusClose.MouseButton1Click, function()
+    UI.statusPanel.Visible = false
+    if API.isMobileUI() and not State.minimized then
+        UI.main.Visible = true
+    end
+    API.updateUI()
+end)
+
+API.bind(UI.statusMin.MouseButton1Click, function()
+    UI.statusPanel.Visible = false
+    if API.isMobileUI() and not State.minimized then
+        UI.main.Visible = true
+    end
+    API.updateUI()
 end)
 
 API.bind(UI.settings.MouseButton1Click, function()
     State.settingsOpen = not State.settingsOpen
     UI.settingsFrame.Visible = State.settingsOpen and not State.minimized
+    UI.manualFrame.Visible = false
     if API.isMobileUI() then
         UI.main.Visible = not State.settingsOpen and not State.minimized
     end
@@ -1431,6 +1803,30 @@ API.bind(UI.closeSettings.MouseButton1Click, function()
         UI.main.Visible = true
     end
 end)
+
+API.bind(UI.manual.MouseButton1Click, function()
+    UI.manualFrame.Visible = true
+    State.settingsOpen = false
+    UI.settingsFrame.Visible = false
+
+    if API.isMobileUI() then
+        UI.main.Visible = false
+    end
+
+    task.defer(function()
+        if UI.manualRefresh then
+            UI.manualRefresh()
+        end
+    end)
+end)
+
+API.bind(UI.manualClose.MouseButton1Click, function()
+    UI.manualFrame.Visible = false
+    if API.isMobileUI() and not State.minimized then
+        UI.main.Visible = true
+    end
+end)
+
 
 for i = 1, 3 do
     local index = i
@@ -1458,9 +1854,45 @@ API.bind(UI.general.anchor.MouseButton1Click, function()
     API.updateSettings()
 end)
 
+API.bind(UI.general.autoSteal.MouseButton1Click, function()
+    State.autoStealOffOnGet = not State.autoStealOffOnGet
+
+    if State.autoStealOffOnGet and State.steal and API.localHasBall() then
+        State.steal = false
+        API.resetSpecial()
+    end
+
+    saveConfig()
+    API.updateUI()
+    API.updateSettings()
+end)
+
+API.bind(UI.general.tp.FocusLost, function()
+    local n = tonumber(UI.general.tp.Text)
+    if n then
+        State.tpDuration = math.clamp(n, 0.1, 60)
+    end
+
+    UI.general.tp.Text = tostring(State.tpDuration)
+    saveConfig()
+    API.updateSettings()
+end)
+
+API.bind(UI.general.goalTarget.MouseButton1Click, function()
+    State.autoGoalTarget = State.autoGoalTarget == "AutoGoal" and "ScoreHitbox" or "AutoGoal"
+    saveConfig()
+    API.updateSettings()
+end)
+
+
 API.bind(UI.steal.MouseButton1Click, function()
     State.steal = not State.steal
-    if State.steal and State.autoStealOffOnGet and API.localHasBall() then State.steal = false end
+
+    if State.steal and State.autoStealOffOnGet and API.localHasBall() then
+        State.steal = false
+        API.resetSpecial()
+    end
+
     API.updateUI()
 end)
 
@@ -1468,12 +1900,28 @@ API.bind(UI.general.autoGoal.MouseButton1Click, function()
     State.autoGoal = not State.autoGoal
     State.autoGoalToken += 1
     State.autoGoalBusy = false
-    if State.autoGoal then State.steal = false end
+    API.resetSpecial()
+
+    if State.autoGoal then
+        State.steal = false
+    end
+
     API.updateUI()
     API.updateSettings()
 end)
 
 API.bind(UI.tp.MouseButton1Click, function() task.spawn(API.startTP) end)
+API.bind(UI.tpTime.FocusLost, function()
+    local n = tonumber(UI.tpTime.Text)
+    if n then
+        State.tpDuration = math.clamp(n, 0.1, 60)
+    end
+
+    UI.tpTime.Text = tostring(State.tpDuration)
+    saveConfig()
+    API.updateSettings()
+end)
+
 API.bind(UI.tpGoal.MouseButton1Click, function() task.spawn(API.tpGoal) end)
 
 -- MORE MODS: load the external More Mods script
@@ -1549,23 +1997,65 @@ API.bind(RunService.Heartbeat, function()
 
                             local goal = API.opponentGoal()
                             local goalPos = API.goalPosition(goal)
-                            if not goal or not goalPos then task.wait(0.08); continue end
+                            if not goal or not goalPos then
+                                task.wait(0.08)
+                                continue
+                            end
 
                             API.rebuildBall(true)
                             local ballState, ballHolder, shotBall = API.getBallState()
-                            if ballState ~= "HELD" or ballHolder ~= LP or not shotBall then task.wait(0.04); continue end
+                            if ballState ~= "HELD" or ballHolder ~= LP or not shotBall then
+                                task.wait(0.04)
+                                continue
+                            end
 
                             local direction = goalPos - shotBall.Position
-                            if direction.Magnitude <= 0.001 then direction = goalPos - Char.root.Position end
+                            if direction.Magnitude <= 0.001 then
+                                direction = goalPos - Char.root.Position
+                            end
 
-                            if API.fireShoot(direction.Unit, CFG.SHOOT_FORCE, false) then
+                            if direction.Magnitude <= 0.001 then
+                                task.wait(0.05)
+                                continue
+                            end
+
+                            direction = direction.Unit
+
+                            if API.fireShoot(direction, CFG.AUTO_GOAL_SHOOT_FORCE, false) then
                                 local released = API.waitForReleasedBall(shotBall, 0.8)
-                                if released then
-                                    API.teleportReleasedBall(released, goal)
-                                    task.wait(0.3)
+
+                                if released and released.Parent then
+                                    while State.autoGoal
+                                        and token == State.autoGoalToken
+                                        and released.Parent do
+
+                                        local currentGoal = API.opponentGoal()
+                                        local currentGoalPos = API.goalPosition(currentGoal)
+                                        if not currentGoal or not currentGoalPos then
+                                            break
+                                        end
+
+                                        pcall(function()
+                                            released.CFrame = currentGoal.CFrame
+                                        end)
+
+                                        API.fireShoot(
+                                            direction,
+                                            CFG.AUTO_GOAL_SHOOT_FORCE,
+                                            false
+                                        )
+
+                                        pcall(function()
+                                            released.AssemblyLinearVelocity =
+                                                direction * CFG.AUTO_GOAL_SHOOT_FORCE
+                                        end)
+
+                                        task.wait(CFG.AUTO_GOAL_SHOOT_INTERVAL)
+                                    end
                                 end
                             end
-                            task.wait(0.08)
+
+                            task.wait(0.05)
                         end
                         if token == State.autoGoalToken then State.autoGoalBusy = false end
                     end)
@@ -1577,7 +2067,9 @@ API.bind(RunService.Heartbeat, function()
     elseif State.steal then
         if State.autoStealOffOnGet and API.localHasBall() then
             State.steal = false
+            API.resetSpecial()
             API.updateUI()
+            API.updateSettings()
         else
             API.stealStep()
         end
@@ -1609,5 +2101,10 @@ getgenv().__BALL_CONTROLLER_V4_STOP = API.stopController
 API.applyResponsiveUI()
 API.updateUI()
 API.updateSettings()
+task.defer(function()
+    if UI.manualRefresh then
+        UI.manualRefresh()
+    end
+end)
 
 print("[Ball Controller V4.5 Complete] Ready to run!")
