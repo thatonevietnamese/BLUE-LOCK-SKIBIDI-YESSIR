@@ -1,18 +1,4 @@
---Ver:01.02.06--
-THANKS tryhard for the actual comment=))
-you are the first one to actually suggest something
-AND NOW I'LL MENTION WHAT I ADD
+--Ver:01.02.07--
+SO I FOUND A BUG WHICH AUTO STEAL NOT TURNING OFF EVEN THE SETTING "AUTO STEAL OFF" IS ON BUT I DON'T HAVE TIME TO FIX . I VERY APOLOGIZE :( next update fix
 1.steall ball
--I add different steal for some character(but well i'm to use the check cooldown thingy and will add later on to prevent spam input)
-2.tp goal
--i switch a bit now bot can catch it sometime but it also make the goal trigger faster!(i will add a button for choosing the goal type fast-not accurate and more accurate option soon)
-3.moremods
--if u not check it yet i combine useful script i made so you don't have to search!
-4.MOBILE FRIENDLY!
--sorry for mobile user , i try my best but the UI keep bugging and i don't know how to make one that suitable :(
--but i did make the ball control work on mobile :)
-5.sae pass
--well i reverb to the first settings , you hold left click and press f will select the nearest teammate, and if u shootball it will keep tp to the teammate until someone pick the ball,including enemy of course :)
-6.auto goal
---still kinda um because i don't to use the old auto goal so i made it spam tp goal ( DO NOT USE IT PUBLIC-IF U WANT TO ONLY USE IT FOR ONE MATCH BECAUSE YOU CAN GET BANNED BECAUSE OF THIS, i got banned so you don't have to...=))
-WELL IDK IF THAT ALL BUT ENJOY THE UPDATE,LOVE YALL :heart:
+-I add different steal for some character include kaiser(use for steal teammate tho),chirigi,etc.I add atleast 7 character but to lazy to include(but well i'm to use the check cooldown thingy and will add later on to prevent spam input)
