@@ -151,10 +151,18 @@ local Traj = {
     filteredCount = 0,
     filterTime = 0,
     forceRefresh = false,
+    predictionDirty = true,
+    lastPredictionPos = nil,
+    lastPredictionVelocity = Vector3.zero,
+    lastPredictionHolder = nil,
+    lastPredictionTime = 0,
+    lastBallScan = 0,
+    ballScanInterval = 0.12,
 
     arrow0 = nil,
     arrow1 = nil,
     arrowBeam = nil,
+    _firstBounce = -1,
 }
 
 Traj.ray = RaycastParams.new()
@@ -172,8 +180,11 @@ local Cooldown = {
     connections = {},
     connectedSources = {},
     recentEvents = {},
-    messageConn = nil,
     layoutConn = nil,
+    updateConn = nil,
+    watcherConn = nil,
+    lastViewport = nil,
+    lastUpdate = 0,
     currentUseMove = nil,
     handleUseMove = nil,
 }
@@ -546,6 +557,14 @@ local ScreenEffectNames = {
     Blindness = true,
     ScreenEffectsGUI = true,
     BlackBars = true,
+    FadeGUI = true,
+    Vignette = true,
+}
+
+local LightingEffectNames = {
+    BlurEffect = true,
+    ColorCorrectionEffect = true,
+    DepthOfFieldEffect = true,
 }
 
 local function removeScreenEffect(obj)
@@ -557,15 +576,25 @@ local function removeScreenEffect(obj)
         end)
 
         if ok and insidePlayerGui then
-            pcall(function()
-                obj:Destroy()
-            end)
+            safeDestroy(obj)
         end
     end
 end
 
+local function removeLightingEffect(obj)
+    if not obj or not obj.Parent then return end
+    if LightingEffectNames[obj.ClassName] or LightingEffectNames[obj.Name] then
+        safeDestroy(obj)
+    end
+end
+
 local function antiBlur(on)
-    disconnect(FeatureConnections.antiBlur)
+    local oldConnections = FeatureConnections.antiBlur
+    if type(oldConnections) == "table" then
+        disconnectList(oldConnections)
+    else
+        disconnect(oldConnections)
+    end
     FeatureConnections.antiBlur = nil
 
     if not on then
@@ -579,8 +608,16 @@ local function antiBlur(on)
         end
     end
 
-    FeatureConnections.antiBlur =
-        PlayerGui.DescendantAdded:Connect(removeScreenEffect)
+    for _, obj in ipairs(game:GetService("Lighting"):GetChildren()) do
+        if LightingEffectNames[obj.ClassName] or LightingEffectNames[obj.Name] then
+            safeDestroy(obj)
+        end
+    end
+
+    local connections = {}
+    connections[#connections + 1] = PlayerGui.DescendantAdded:Connect(removeScreenEffect)
+    connections[#connections + 1] = game:GetService("Lighting").ChildAdded:Connect(removeLightingEffect)
+    FeatureConnections.antiBlur = connections
 
     setStatus("SCREEN EFFECT CLEANUP ON")
     return true
@@ -598,8 +635,20 @@ local BALL_NAMES = {
     "TpsBall",
 }
 
-local function findBall()
-    -- Ưu tiên các ball đang nằm trong character.
+local function findBall(force)
+    local now = os.clock()
+
+    if not force
+        and Traj.ball
+        and Traj.ball.Parent
+        and now - Traj.lastBallScan < Traj.ballScanInterval
+    then
+        return Traj.ball, Traj.holder
+    end
+
+    Traj.lastBallScan = now
+
+    -- Ưu tiên ball đang nằm trong character.
     for _, player in ipairs(Players:GetPlayers()) do
         local char = player.Character
         if char then
@@ -683,6 +732,12 @@ local function clearTrajectory()
     Traj.filteredCount = 0
     Traj.filterTime = 0
     Traj.filterDirty = true
+    Traj.predictionDirty = true
+    Traj.lastPredictionPos = nil
+    Traj.lastPredictionVelocity = Vector3.zero
+    Traj.lastPredictionHolder = nil
+    Traj.lastPredictionTime = 0
+    Traj.lastBallScan = 0
 end
 
 local function unit(v)
@@ -714,11 +769,17 @@ local function updateMovement(ball, holder)
         Traj.lastPos = ball.Position
         Traj.lastTime = now
         Traj.lastVel = now
-        Traj.velocity = Vector3.zero
+        Traj.velocity = ball.AssemblyLinearVelocity
         Traj.smooth = Vector3.zero
+        Traj.heldDir = Vector3.zero
+        Traj.heldSpeed = 0
+        Traj.predictionDirty = true
     end
 
     if holder then
+        local oldDir = Traj.heldDir
+        local oldSpeed = Traj.heldSpeed
+
         Traj.heldDir = holderDirection(holder)
 
         local root =
@@ -731,12 +792,14 @@ local function updateMovement(ball, holder)
             speed = Vector3.new(av.X, 0, av.Z).Magnitude
         end
 
-        if speed > 0 then
-            Traj.heldSpeed = speed
-        end
+        Traj.heldSpeed = speed > 0 and speed or Traj.heldSpeed
+        Traj.smooth = Traj.heldDir * math.max(Traj.heldSpeed, 1)
 
-        Traj.smooth =
-            Traj.heldDir * math.max(Traj.heldSpeed, 1)
+        if oldDir:Dot(Traj.heldDir) < 0.995
+            or math.abs(oldSpeed - Traj.heldSpeed) > 1.0
+        then
+            Traj.predictionDirty = true
+        end
 
         Traj.lastPos = ball.Position
         Traj.lastTime = now
@@ -747,6 +810,7 @@ local function updateMovement(ball, holder)
         Traj.lastPos = ball.Position
         Traj.lastTime = now
         Traj.velocity = ball.AssemblyLinearVelocity
+        Traj.predictionDirty = true
         return
     end
 
@@ -757,6 +821,7 @@ local function updateMovement(ball, holder)
     local dt = now - Traj.lastTime
     if dt <= 0 then return end
 
+    local oldVelocity = Traj.velocity
     local v = (ball.Position - Traj.lastPos) / dt
     Traj.velocity = v
 
@@ -765,8 +830,11 @@ local function updateMovement(ball, holder)
     if hv.Magnitude > Traj.minSpeed then
         Traj.smooth = Traj.smooth:Lerp(hv, Traj.smoothing)
     else
-        Traj.smooth =
-            Traj.smooth:Lerp(Vector3.zero, Traj.smoothing)
+        Traj.smooth = Traj.smooth:Lerp(Vector3.zero, Traj.smoothing)
+    end
+
+    if (v - oldVelocity).Magnitude > 1.25 then
+        Traj.predictionDirty = true
     end
 
     Traj.lastPos = ball.Position
@@ -931,27 +999,22 @@ local function renderTrajectory()
         return
     end
 
-    if Traj.forceRefresh then
-        Traj.lastBall = nil
-        Traj.lastPos = nil
-        Traj.lastTime = 0
-        Traj.lastVel = 0
-        Traj.filterDirty = true
+    local force = Traj.forceRefresh
+    if force then
+        Traj.lastBallScan = 0
+        Traj.predictionDirty = true
         Traj.forceRefresh = false
     end
 
-    local ball, holder = findBall()
+    local ball, holder = findBall(force)
 
     if not ball then
         clearTrajectory()
         return
     end
 
-    if Traj.ball ~= ball then
-        Traj.lastBall = nil
-        Traj.lastPos = nil
-        Traj.lastTime = 0
-        Traj.lastVel = 0
+    if Traj.ball ~= ball or Traj.holder ~= holder then
+        Traj.predictionDirty = true
         Traj.filterDirty = true
     end
 
@@ -961,16 +1024,60 @@ local function renderTrajectory()
     updateMovement(ball, holder)
     updateRayFilter(ball)
 
-    local firstBounce = predictTrajectory(ball, holder)
+    local now = os.clock()
+    local currentVelocity = holder
+        and (holderDirection(holder) * math.max(Traj.heldSpeed, 1))
+        or Traj.velocity
 
-    if #Traj.points < 2 then
-        clearTrajectory()
-        return
+    if currentVelocity.Magnitude < 1.2 then
+        currentVelocity = ball.AssemblyLinearVelocity
     end
 
-    local maxIndex =
-        firstBounce > 0 and firstBounce or #Traj.points
+    if Traj.lastPredictionPos then
+        local moved = (ball.Position - Traj.lastPredictionPos).Magnitude
+        local velocityChanged =
+            (currentVelocity - Traj.lastPredictionVelocity).Magnitude > 1.25
 
+        if moved > 0.12 or velocityChanged then
+            Traj.predictionDirty = true
+        end
+    else
+        Traj.predictionDirty = true
+    end
+
+    -- Safety refresh: keeps gravity/physics drift from leaving an old path forever.
+    if now - Traj.lastPredictionTime > 0.15 then
+        Traj.predictionDirty = true
+    end
+
+    if Traj.predictionDirty then
+        local firstBounce = predictTrajectory(ball, holder)
+        Traj.lastPredictionPos = ball.Position
+        Traj.lastPredictionVelocity = currentVelocity
+        Traj.lastPredictionHolder = holder
+        Traj.lastPredictionTime = now
+        Traj.predictionDirty = false
+
+        if #Traj.points < 2 then
+            clearTrajectory()
+            return
+        end
+
+        Traj._firstBounce = firstBounce
+    elseif Traj.lastPredictionPos and #Traj.points > 0 then
+        -- Move the cached path with the ball between physics changes instead
+        -- of raycasting the entire trajectory every render frame.
+        local delta = ball.Position - Traj.lastPredictionPos
+        if delta.Magnitude > 0.001 then
+            for i = 1, #Traj.points do
+                Traj.points[i] += delta
+            end
+            Traj.lastPredictionPos = ball.Position
+        end
+    end
+
+    local firstBounce = Traj._firstBounce or -1
+    local maxIndex = firstBounce > 0 and firstBounce or #Traj.points
     local beamIndex = 1
 
     for i = 1, maxIndex do
@@ -1037,8 +1144,7 @@ local function renderTrajectory()
 
         Traj.arrowBeam.Width0 = 0.55
         Traj.arrowBeam.Width1 = 0.30
-        Traj.arrowBeam.Color =
-            ColorSequence.new(Traj.color)
+        Traj.arrowBeam.Color = ColorSequence.new(Traj.color)
         Traj.arrowBeam.Enabled = true
     end
 end
@@ -1049,7 +1155,6 @@ end
 
 local function destroyCooldownBar(entry)
     if not entry then return end
-
     safeDestroy(entry.label)
 end
 
@@ -1066,8 +1171,10 @@ local function cooldownIdentifierKey(skillIdentifier)
     end
 
     if t == "table" then
-        local name = rawget(skillIdentifier, "Name")
-        if name ~= nil then
+        local ok, name = pcall(function()
+            return rawget(skillIdentifier, "Name")
+        end)
+        if ok and name ~= nil then
             return "table:" .. tostring(name)
         end
     end
@@ -1099,12 +1206,20 @@ local function createCooldownBar(skillIdentifier, duration)
     end
 
     local skillName = "Unknown Skill"
-    if typeof(skillIdentifier) == "Instance" then
-        skillName = skillIdentifier.Name
-    elseif typeof(skillIdentifier) == "string" or typeof(skillIdentifier) == "number" then
+    local identifierType = typeof(skillIdentifier)
+
+    if identifierType == "Instance" then
+        local ok, name = pcall(function() return skillIdentifier.Name end)
+        if ok and name then
+            skillName = name
+        end
+    elseif identifierType == "string" or identifierType == "number" then
         skillName = "Move " .. tostring(skillIdentifier)
-    elseif typeof(skillIdentifier) == "table" and skillIdentifier.Name then
-        skillName = tostring(skillIdentifier.Name)
+    elseif identifierType == "table" then
+        local ok, name = pcall(function() return skillIdentifier.Name end)
+        if ok and name then
+            skillName = tostring(name)
+        end
     end
 
     local cdTime = tonumber(duration)
@@ -1112,9 +1227,6 @@ local function createCooldownBar(skillIdentifier, duration)
         return
     end
 
-    -- Một cooldown có thể được phát hiện đồng thời từ:
-    -- RemoteEvent/BindableEvent và UseMove hook.
-    -- Chặn bản ghi giống nhau trong một cửa sổ rất ngắn để không tạo 2 bar.
     if isDuplicateCooldown(skillIdentifier, cdTime) then
         return
     end
@@ -1131,61 +1243,55 @@ local function createCooldownBar(skillIdentifier, duration)
     label.Parent = Cooldown.list
     corner(label, 6)
 
-    local entry = {label = label}
+    local entry = {
+        label = label,
+        skillName = skillName,
+        expiresAt = os.clock() + cdTime,
+    }
     table.insert(Cooldown.bars, 1, entry)
 
-    if #Cooldown.bars > MAX_VISIBLE_BARS then
+    while #Cooldown.bars > MAX_VISIBLE_BARS do
         local oldest = table.remove(Cooldown.bars, #Cooldown.bars)
         if oldest then
             destroyCooldownBar(oldest)
         end
     end
-
-    task.spawn(function()
-        local startTime = os.clock()
-
-        while Cooldown.enabled and label.Parent do
-            local remaining = cdTime - (os.clock() - startTime)
-            if remaining <= 0 then
-                break
-            end
-
-            label.Text = string.format("  ⏳ %s: %.1fs", skillName, remaining)
-            task.wait(0.05)
-        end
-
-        destroyCooldownBar(entry)
-
-        local idx = table.find(Cooldown.bars, entry)
-        if idx then
-            table.remove(Cooldown.bars, idx)
-        end
-    end)
 end
 
-
-local function findEventByNames(parent, names, classes)
-    for _, name in ipairs(names) do
-        local obj = parent:FindFirstChild(name, true)
-
-        if obj then
-            for _, className in ipairs(classes) do
-                if obj:IsA(className) then
-                    return obj
-                end
-            end
-        end
+local function updateCooldownBars()
+    if not Cooldown.enabled then
+        return
     end
 
-    return nil
+    local now = os.clock()
+    if now - Cooldown.lastUpdate < 0.05 then
+        return
+    end
+    Cooldown.lastUpdate = now
+
+    for i = #Cooldown.bars, 1, -1 do
+        local entry = Cooldown.bars[i]
+        local label = entry and entry.label
+
+        if not entry or not label or not label.Parent or now >= entry.expiresAt then
+            if entry then
+                destroyCooldownBar(entry)
+            end
+            table.remove(Cooldown.bars, i)
+        else
+            local remaining = math.max(0, entry.expiresAt - now)
+            label.Text = string.format("  ⏳ %s: %.1fs", entry.skillName, remaining)
+        end
+    end
 end
 
 local function disconnectCooldownEvents()
     disconnectList(Cooldown.connections)
     table.clear(Cooldown.connectedSources)
 
-    disconnect(Cooldown.messageConn)
-    Cooldown.messageConn = nil
+    disconnect(Cooldown.watcherConn)
+    Cooldown.watcherConn = nil
+
 end
 
 local function connectCooldownSource(source)
@@ -1254,7 +1360,7 @@ local function setupCooldownGui()
     end)
 end
 
-local function layoutCooldownGui()
+local function layoutCooldownGui(force)
     if not Cooldown.gui
         or not Cooldown.gui.Parent
         or not Cooldown.list
@@ -1268,6 +1374,11 @@ local function layoutCooldownGui()
         camera
         and camera.ViewportSize
         or Vector2.new(1280, 720)
+
+    if not force and Cooldown.lastViewport == vp then
+        return
+    end
+    Cooldown.lastViewport = vp
 
     local width =
         math.min(240, math.max(190, vp.X - 24))
@@ -1308,46 +1419,38 @@ local function setupCooldownEvents()
     end
 
     table.clear(Cooldown.recentEvents)
+    Cooldown.lastUpdate = 0
     setupCooldownGui()
 
-    -- Source 1: ReplicatedStorage.Events.CooldownMove
-    local eventsFolder = ReplicatedStorage:FindFirstChild("Events")
-    local cooldownMove = eventsFolder and eventsFolder:FindFirstChild("CooldownMove")
-    connectCooldownSource(cooldownMove)
+    local cooldownNames = {
+        CooldownMove = true,
+        CooldownBind = true,
+        CooldownRemote = true,
+        CooldownEvent = true,
+        Cooldown = true,
+    }
 
-    -- Source 2: ReplicatedStorage.Events.UI
-    local uiEvents = eventsFolder and eventsFolder:FindFirstChild("UI")
-    if uiEvents then
-        connectCooldownSource(uiEvents:FindFirstChild("CooldownBind"))
-        connectCooldownSource(uiEvents:FindFirstChild("CooldownRemote"))
+    local function tryConnect(obj)
+        if not obj then return end
+
+        if obj:IsA("RemoteEvent") or obj:IsA("BindableEvent") then
+            if cooldownNames[obj.Name] then
+                connectCooldownSource(obj)
+            end
+        elseif obj:IsA("RemoteFunction") and obj.Name == "UseMove" then
+            Cooldown.currentUseMove = obj
+        end
     end
 
-    -- Fallback: other games/versions may place the same remotes elsewhere.
-    -- connectCooldownSource() deduplicates the exact same Instance so a
-    -- recursively-found source cannot be connected twice.
-    local bindable = findEventByNames(
-        ReplicatedStorage,
-        {"CooldownBind", "CooldownEvent", "Cooldown"},
-        {"BindableEvent"}
-    )
-    local remote = findEventByNames(
-        ReplicatedStorage,
-        {"CooldownRemote", "CooldownEvent", "Cooldown"},
-        {"RemoteEvent"}
-    )
+    local messageNames = {
+        SendMessage = true,
+        Messages = true,
+    }
 
-    connectCooldownSource(bindable)
-    connectCooldownSource(remote)
+    local function connectMessageSource(source)
+        if not source or not source:IsA("RemoteEvent") then return end
 
-    -- Awakening status.
-    local messageRemote = findEventByNames(
-        ReplicatedStorage,
-        {"SendMessage", "Messages"},
-        {"RemoteEvent"}
-    )
-
-    if messageRemote and messageRemote.Name == "SendMessage" then
-        Cooldown.messageConn = messageRemote.OnClientEvent:Connect(function(message)
+        Cooldown.connections[#Cooldown.connections + 1] = source.OnClientEvent:Connect(function(message)
             if typeof(message) ~= "string" or not Cooldown.status then
                 return
             end
@@ -1362,21 +1465,55 @@ local function setupCooldownEvents()
         end)
     end
 
-    -- Source 3: UseMove hook.
-    -- Hook này là hook toàn game, nên chỉ được cài MỘT lần trong ENV.
-    -- Runtime hiện tại chỉ đăng ký RemoteFunction đang dùng.
-    local useMove = eventsFolder and eventsFolder:FindFirstChild("UseMove")
-    Cooldown.currentUseMove =
-        useMove and useMove:IsA("RemoteFunction") and useMove or nil
+    -- Scan every existing descendant once. This catches duplicate/nested versions
+    -- instead of relying on only the first FindFirstChild() match.
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteFunction") and obj.Name == "UseMove" then
+            Cooldown.currentUseMove = obj
+        elseif (obj:IsA("RemoteEvent") or obj:IsA("BindableEvent")) and cooldownNames[obj.Name] then
+            connectCooldownSource(obj)
+        elseif obj:IsA("RemoteEvent") and messageNames[obj.Name] then
+            connectMessageSource(obj)
+        end
+    end
 
+    -- Watch for remotes/functions created after Show CD is enabled.
+    Cooldown.watcherConn = ReplicatedStorage.DescendantAdded:Connect(function(obj)
+        if not Cooldown.enabled or not obj then
+            return
+        end
+
+        if obj:IsA("RemoteFunction") and obj.Name == "UseMove" then
+            Cooldown.currentUseMove = obj
+            return
+        end
+
+        if (obj:IsA("RemoteEvent") or obj:IsA("BindableEvent")) and cooldownNames[obj.Name] then
+            connectCooldownSource(obj)
+            return
+        end
+
+        if obj:IsA("RemoteEvent") and messageNames[obj.Name] then
+            connectMessageSource(obj)
+        end
+    end)
+
+    local removingWatcher = ReplicatedStorage.DescendantRemoving:Connect(function(obj)
+        if obj == Cooldown.currentUseMove then
+            Cooldown.currentUseMove = nil
+        end
+        if Cooldown.connectedSources[obj] then
+            Cooldown.connectedSources[obj] = nil
+        end
+    end)
+    Cooldown.connections[#Cooldown.connections + 1] = removingWatcher
+
+    -- Hook once globally; only the active runtime receives the result.
     local hookKey = "__BALL_CONTROLLER_COOLDOWN_USEMOVE_HOOK"
     local hookState = ENV[hookKey]
 
     if type(hookState) ~= "table" then
-        hookState = {
-            installed = false,
-            runtime = nil,
-        }
+        hookState = {installed = false, runtime = nil}
         ENV[hookKey] = hookState
     end
 
@@ -1389,31 +1526,47 @@ local function setupCooldownEvents()
         local oldNamecall
         local ok = pcall(function()
             oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+                local previous = oldNamecall
+                if not previous then
+                    return
+                end
+
                 local method = getnamecallmethod()
-                local args = {...}
+                if method ~= "InvokeServer" and method ~= "invokeServer" then
+                    return previous(self, ...)
+                end
 
-                local result = table.pack(oldNamecall(self, ...))
                 local runtime = hookState.runtime
+                if not runtime or not runtime.enabled then
+                    return previous(self, ...)
+                end
 
-                local isUseMove =
-                    runtime
-                    and runtime.enabled
-                    and (self == runtime.currentUseMove
-                        or (
-                            (not runtime.currentUseMove or not runtime.currentUseMove.Parent)
-                            and self.Name == "UseMove"
-                            and self:IsA("RemoteFunction")
-                        ))
-                    and (method == "InvokeServer" or method == "invokeServer")
+                local useMoveObject = runtime.currentUseMove
+                local isUseMove = self == useMoveObject
 
-                if isUseMove then
-                    runtime.currentUseMove = self
-
-                    local moveId = args[1]
-                    local cooldownTime = result[1]
-                    if cooldownTime and runtime.handleUseMove then
-                        runtime.handleUseMove(moveId, cooldownTime)
+                if not isUseMove and (not useMoveObject or not useMoveObject.Parent) then
+                    local okTarget = pcall(function()
+                        return self.Name == "UseMove" and self:IsA("RemoteFunction")
+                    end)
+                    isUseMove = okTarget and true or false
+                    if isUseMove then
+                        runtime.currentUseMove = self
                     end
+                end
+
+                if not isUseMove then
+                    return previous(self, ...)
+                end
+
+                local args = table.pack(...)
+                local result = table.pack(previous(self, table.unpack(args, 1, args.n)))
+                local cooldownTime = result[1]
+
+                if type(cooldownTime) == "number"
+                    and cooldownTime > 0
+                    and runtime.handleUseMove
+                then
+                    pcall(runtime.handleUseMove, args[1], cooldownTime)
                 end
 
                 return table.unpack(result, 1, result.n)
@@ -1424,6 +1577,10 @@ local function setupCooldownEvents()
             hookState.installed = true
         end
     end
+
+    -- One shared timer replaces one coroutine per active cooldown.
+    disconnect(Cooldown.updateConn)
+    Cooldown.updateConn = RunService.Heartbeat:Connect(updateCooldownBars)
 end
 
 Cooldown.handleUseMove = createCooldownBar
@@ -1434,11 +1591,16 @@ local function setCooldown(on)
     if on then
         setupCooldownEvents()
         setupCooldownGui()
-        layoutCooldownGui()
+        Cooldown.lastViewport = nil
+        layoutCooldownGui(true)
         setStatus("Show CD ON")
     else
         disconnectCooldownEvents()
+        disconnect(Cooldown.updateConn)
+        Cooldown.updateConn = nil
         Cooldown.currentUseMove = nil
+        Cooldown.lastViewport = nil
+        Cooldown.lastUpdate = 0
         table.clear(Cooldown.recentEvents)
 
         for _, entry in ipairs(Cooldown.bars) do
@@ -1881,6 +2043,7 @@ bind(workspace.DescendantAdded, function(obj)
     then
         Traj.forceRefresh = true
         Traj.filterDirty = true
+        Traj.lastBallScan = 0
     end
 end)
 
@@ -1893,6 +2056,7 @@ bind(workspace.DescendantRemoving, function(obj)
     then
         clearTrajectory()
         Traj.forceRefresh = true
+        Traj.lastBallScan = 0
     end
 end)
 
@@ -1907,7 +2071,7 @@ end)
 
 bind(RunService.RenderStepped, function()
     if Cooldown.enabled then
-        layoutCooldownGui()
+        layoutCooldownGui(false)
     end
 end)
 
@@ -1954,7 +2118,11 @@ local function Cleanup()
     Traj.enabled = false
     clearTrajectory()
 
-    disconnect(FeatureConnections.antiBlur)
+    if type(FeatureConnections.antiBlur) == "table" then
+        disconnectList(FeatureConnections.antiBlur)
+    else
+        disconnect(FeatureConnections.antiBlur)
+    end
     FeatureConnections.antiBlur = nil
 
     disconnect(CameraShakeWatcher)
@@ -1971,6 +2139,7 @@ local function Cleanup()
     disconnectCooldownEvents()
     Cooldown.currentUseMove = nil
     Cooldown.handleUseMove = nil
+    Cooldown.lastUpdate = 0
     table.clear(Cooldown.recentEvents)
 
     local hookState = ENV["__BALL_CONTROLLER_COOLDOWN_USEMOVE_HOOK"]
@@ -1986,6 +2155,10 @@ local function Cleanup()
 
     disconnect(Cooldown.layoutConn)
     Cooldown.layoutConn = nil
+    disconnect(Cooldown.updateConn)
+    Cooldown.updateConn = nil
+    disconnect(Cooldown.watcherConn)
+    Cooldown.watcherConn = nil
 
     disconnectList(Connections)
 
