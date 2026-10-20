@@ -1,4 +1,3 @@
---Ver:1.2.36--
-I FELT BORED AFTER ALL...LIKE DOES EVERYBODY USING MY SCRIPT EVEN USE IT, I KNOW NOT MANY PEOPLE USE IT,LIKE ONLY A FEW BUT CAN YA EVEN COMMENT ONCE SO I DON'T FEEL TOO LONELY :(
-BTW,I FIND A WAY THAT YOU CAN USE TO FARM MONEY(IN DEVELOPMENTT) BUT YOU CAN GET 200k-600k EVERY HOUR!
---RequestImage:https://www.goodtherapy.org/blog/blog/wp-content/uploads/2014/12/man-with-head-down-300x300.jpg--
+--Ver:1.2.37--
+WELL, so it been a time since the last time i update this script, i just notice somebody report to me that the ball have a bug? SO WILL I ADD A PATCH VERSION? NAh i lazy af, but if u guys want then tell me what bug it is, not like this one...
+--RequestImage:https://files.catbox.moe/sb6nf5.jpg--
