@@ -1777,7 +1777,7 @@ do
             return
         end
 
-        signal:Connect(function(moveId, cooldownTime)
+        API.bind(signal, function(moveId, cooldownTime)
             rememberCooldown(moveId, cooldownTime)
         end)
     end
@@ -3527,6 +3527,11 @@ do
     end
 
     function API.startTP()
+        if State.autoGoal then
+            API.notify("TP RETURN", "Turn Auto Goal off first", 1.2)
+            return
+        end
+
         if State.tpActive then
             API.restoreTP("Returned")
             return
@@ -3730,6 +3735,11 @@ do
     end
 
     function API.tpGoal()
+        if State.autoGoal then
+            API.notify("TP GOAL", "Auto Goal is already controlling the ball", 1.2)
+            return
+        end
+
         local goal =
             API.tpGoalTarget()
 
@@ -6965,20 +6975,26 @@ do
                 and 2
                 or 1
 
-            State.enabled =
-                false
+            -- Mode changes are a control boundary: release every held input
+            -- and stop mode-specific actions before changing the active controller.
+            State.enabled = false
+            State.forceUnanchor = false
+            State.keys = {W = false, A = false, S = false, D = false, Q = false, E = false}
+            State.leftMouseHeld = false
+            State.specialSelecting = false
 
-            State.forceUnanchor =
-                false
+            State.autoGoalToken += 1
+            State.autoGoal = false
+            State.autoGoalBusy = false
+            State.tpActive = false
+            State.tpReturn = nil
+            State.tpGoalActive = false
 
             API.unlockPlayer()
             API.restoreCamera()
             API.stopRonaldo()
             API.clearSAE()
             API.resetSpecial()
-
-            State.specialSelecting =
-                false
 
             if State.mode ~= 1 then
                 State.advance =
@@ -7178,16 +7194,26 @@ do
     API.bind(
         UI.general.autoGoal.MouseButton1Click,
         function()
-            State.autoGoal =
-                not State.autoGoal
+            State.autoGoal = not State.autoGoal
 
+            -- Auto Goal owns ball movement while running. Prevent the regular
+            -- controller, SAE pass, Ronaldo, TP-return and standalone steal from
+            -- writing to the same ball/player at the same time.
             State.autoGoalToken += 1
-            State.autoGoalBusy =
-                false
+            State.autoGoalBusy = false
 
             if State.autoGoal then
-                State.steal =
-                    false
+                State.steal = false
+                State.enabled = false
+                State.tpActive = false
+                State.tpReturn = nil
+                State.tpGoalActive = false
+                State.keys = {W = false, A = false, S = false, D = false, Q = false, E = false}
+                API.stopRonaldo()
+                API.clearSAE()
+                API.resetSpecial()
+                API.restoreCamera()
+                API.unlockPlayer()
 
                 API.notify(
                     "AUTO GOAL",
@@ -7195,6 +7221,7 @@ do
                     1.0
                 )
             else
+                State.tpGoalActive = false
                 API.notify(
                     "AUTO GOAL",
                     "OFF",
@@ -7533,8 +7560,8 @@ do
                 not State.enabled
 
             if State.enabled then
-                State.forceUnanchor =
-                    false
+                State.forceUnanchor = false
+                State.tpGoalActive = false
 
                 local _, _, ball =
                     API.getBallState()
@@ -7840,8 +7867,8 @@ do
                     not State.enabled
 
                 if State.enabled then
-                    State.forceUnanchor =
-                        false
+                    State.forceUnanchor = false
+                    State.tpGoalActive = false
 
                     local _, _, ball =
                         API.getBallState()
@@ -7890,6 +7917,17 @@ do
                         1.0
                     )
                 end
+            end
+        end
+    )
+
+    API.bind(
+        UIS.WindowFocusReleased,
+        function()
+            State.keys = {W = false, A = false, S = false, D = false, Q = false, E = false}
+            State.leftMouseHeld = false
+            if State.saeTempActive and not State.saeTarget then
+                API.clearSAE()
             end
         end
     )
@@ -7987,12 +8025,9 @@ API.bind(
         API.clearSAE()
         API.resetSpecial()
 
-        State.enabled =
-            false
-
-        State.steal =
-            false
-
+        State.enabled = false
+        State.steal = false
+        State.autoGoal = false
         State.tpActive =
             false
 
@@ -8412,7 +8447,7 @@ API.bind(
                 end
             end
 
-        elseif State.steal then
+        elseif State.steal and not State.tpActive then
             if State.autoStealOffOnGet
                 and API.localHasBall()
             then
@@ -8433,9 +8468,16 @@ API.bind(
             API.updateTP()
         end
 
+        local ballMovementOwned =
+            State.autoGoal
+            or State.tpGoalActive
+            or State.ronaldoActive
+            or State.saeStage == "FLYING"
+
         if State.enabled
             and State.mode == 1
             and ball
+            and not ballMovementOwned
         then
             if State.advance then
                 local f,
@@ -8561,8 +8603,9 @@ function API.stopController()
     State.tpReturn =
         nil
 
-    State.tpGoalActive =
-        false
+    State.tpGoalActive = false
+    State.keys = {W = false, A = false, S = false, D = false, Q = false, E = false}
+    State.leftMouseHeld = false
 
     API.stopRonaldo()
     API.clearSAE()
