@@ -1,3 +1,3 @@
 --Ver:1.2.38--
-WELL, so it been a time since the last time i update this script, i just noticed that somebody report to me that the ball have a bug? WDYM ?ADD SOME DETAILS PLEASE I DONT GET IT =)?.
---RequestImage:https://files.catbox.moe/sb6nf5.jpg--
+THANKS FOR THE REPORT MAN, ILL WILL FIX IT ASAP.
+--RequestImage:https://files.catbox.moe/p15c9i.png--
